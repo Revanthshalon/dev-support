@@ -145,7 +145,8 @@ indexing:
 ```
 - **Set right before indexing:** `ops index --max-file-bytes 8MiB`, or
   `OPS_INDEXING__MAX_FILE_BYTES=8MiB` (works for `ops watch` and `reindex` too). The flag wins
-  over the env var, and the env var wins over `ops.yaml`.
+  over the env var, and the env var wins over `ops.yaml`. The flag lasts one run; the next run
+  without it reverts to the configured limit. Use `overrides` or the env var for a lasting change.
 - `indexing` is part of `parse_fingerprint`, so raising the limit picks the previously skipped
   files up on the next run.
 - **Skips are reported, not silent.** `IndexReport.skipped` lists `{path, size, reason}`, with
@@ -246,6 +247,9 @@ For every `ABOUT` / `STEP` / `FROM` / `TO` edge:
 - **It no longer exists:** try to re-attach by `qualname` within the same service (the code moved
   file). If exactly one match, re-point the edge and mark `stale`. Otherwise mark `orphaned` and
   keep the edge's `anchor_key` so a human or agent can fix it.
+- **The code comes back** (branch switch back, file restored, size limit raised again): an
+  orphaned anchor whose `anchor_key` exists again is re-attached, and the entry becomes `current`
+  if the hash matches, else `stale`.
 - `retracted` entries are skipped.
 
 Only nodes that vanish lose edges. Before deleting them, step 2 of §3 records
@@ -334,7 +338,9 @@ semantic:
       strategy: syntax           # syntax | lines
       aggregate: max             # how a symbol's chunks score: max | mean_top2
 ```
-The *resolved* values (with `auto` turned into a number) are part of `parse_fingerprint`.
+The *resolved* values (with `auto` turned into a number) are part of `parse_fingerprint`. The
+resolved `max_tokens` is stored on `IndexRun`, and reused when model info is temporarily
+unavailable, so a transient failure never forces a re-parse.
 Changing them re-chunks everything on the next run. A model swap that keeps the same resolved
 `max_tokens` only re-embeds.
 

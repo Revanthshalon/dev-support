@@ -259,7 +259,12 @@ indexing:
 ```
 
 To set it right before a run, use `ops index --max-file-bytes 8MiB` or
-`OPS_INDEXING__MAX_FILE_BYTES=8MiB ops index`. The env var also works for `ops watch`. Raising the
+`OPS_INDEXING__MAX_FILE_BYTES=8MiB ops index`. The env var also works for `ops watch`.
+
+> [!NOTE]
+> The flag lasts **one run only**. The next run without it, including `ops watch`, goes back to
+> the configured limit and drops those files again. Knowledge attached to them is re-attached when
+> they return. For a lasting change, use an `overrides` entry or the env var. Raising the
 limit re-parses on the next run, so files that were skipped get picked up. `ops index` lists the
 largest skipped files with their reason; `--show-skipped` lists all of them.
 

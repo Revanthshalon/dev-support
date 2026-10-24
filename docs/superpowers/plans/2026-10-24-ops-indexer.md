@@ -125,6 +125,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   with `model: {env: EMBEDDINGS_MODEL, default: "all-MiniLM-L6-v2"}` and EMBEDDINGS_MODEL=openai/text-embedding-3-small in .env → resolves to the openai model;
   concurrency 40 → validate reports it; incidents.dir defaults to "docs/incidents" */ }
 #[test] fn byte_size_and_overrides() { assert_eq!("8MiB".parse::<ByteSize>().unwrap().0, 8 << 20); assert_eq!("0".parse::<ByteSize>().unwrap().0, 0); assert!("8MB?".parse::<ByteSize>().is_err());
+  /* deserializes from YAML string "8MiB", YAML integer 8388608, and env string "8388608" alike */
   /* overrides [legacy/**/*.py → 8MiB, **/generated/** → skip]: limit_for("services/legacy/a/x.py").max_bytes == Some(8<<20); limit_for("x/generated/y.ts").skip; default → Some(1<<20); max_file_bytes 0 → None */ }
 #[test] fn chunking_defaults() { /* no chunking section → enabled, MaxTokens::Auto, overlap 32, max_chunks 32, Strategy::Syntax, Aggregate::Max; overlap 300 with max_tokens 256 → validate problem */ }
 #[test] fn ops_env_override() { /* tmp ops.yaml port 7687; with OPS_MEMGRAPH__PORT=7688 set for the test → ctx.config.memgraph.port == 7688 (u16; may need config's try_parsing(true)) */ }
@@ -212,6 +213,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `@router.post("/{order_id}/pay") def pay(order_id, db=Depends(get_db))` calls `charge(order_id)`, and inside `except` calls `logger.error("payment failed for order %s", order_id)`.
   - `def charge(...)` reads `os.getenv("PAYMENT_GATEWAY_URL")`.
   - `app.include_router(router, prefix="/api")`.
+- `services/orders/app/refunds.py`: one long function `reconcile_refunds`, about 200 lines of simple statements (loops over refunds, ledger updates). Its **last** block contains a comment and a log line mentioning "refund ledger". It's used by the chunking tests in Task 6, Task 7c and Part 2 Task 8b.
 - `services/worker/requirements.txt`, and `services/worker/worker.py` with `def run(): log.warning(f"retrying job {job_id}")` and `if __name__ == "__main__": run()`.
 - `libs/common/pyproject.toml` and `libs/common/common/db.py` with `def get_db()`. `orders/app/main.py` does `from common.db import get_db`.
 - `libs/common/common/models.py`: `class PayRequest(BaseModel): amount: int`. `pay` takes `body: PayRequest` (`main.py` imports `from common.models import PayRequest`), and `worker.py` imports `from common.models import PayRequest`.
@@ -427,7 +429,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `graph::workspace_graph(ctx: &Ctx) -> Result<Graph>`: Service/Datastore/EnvVar/Contract/Endpoint/Schema-from-OpenAPI nodes, plus docker edges (DEPENDS_ON CONNECTS_TO SHARES_VOLUME SETS_ENV USES_DATASTORE PROVIDES DECLARES DEFINES_SCHEMA). No per-file parsing.
   - `graph::LINK_RELS: &[&str] = &["CALLS","CALLS_API","USES_SCHEMA","IMPLEMENTED_BY","INJECTS","TEMPLATE_BINDS","USES_LIB","CONSUMES","BOUNDARY"]`
   - `graph::link(ctx: &Ctx, nodes: &[Node], workspace_edges: &[Edge]) -> (Vec<Edge>, usize /* unresolved calls */)`: computes every LINK_RELS edge from node properties (`calls`, `http_calls`, `uses_types`, `injects`, `template_url`, `imports` on File, `routes`, `qualname`, `unit`) plus `workspace_edges` (`DEPENDS_ON`, `CONNECTS_TO`, `SHARES_VOLUME` and `PROVIDES`, needed for `BOUNDARY` and `CONSUMES`). It never reads files. `BOUNDARY` is computed last, from the other link edges and `workspace_edges`.
-  - `graph::build(ctx: &Ctx) -> Result<Graph>`: `workspace_graph` + every `file_graph` + `link`. Used by `--dry-run`, by `--full` and by tests.
+  - `graph::build(ctx: &Ctx) -> Result<Graph>`: `workspace_graph` + every `file_graph` + `link`, with `ChunkParams::resolve(cfg, None, false)`. Used by `--dry-run` and tests, so dry-run chunk counts are provisional (256-token budget). `store::index` calls `file_graph` itself, with the resolved params.
   - `graph::card(node: &Node) -> Option<String>`: the card **header** for Function/Class/Component/Injectable/Schema/Route: kind, qualname, signature, doc, decorators/route, log templates, file path, joined by newlines and capped at 1 KiB. `None` for other labels. Every chunk of the symbol starts with this header.
   - Labels and rels are exactly those in the spec's graph model. In full:
     - Labels: `Service Datastore File Function Class Component Injectable Schema LogStatement Route EnvVar Contract Endpoint Chunk`.
@@ -476,7 +478,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   let g = build(&ctx()).unwrap(); assert!(g.nodes.iter().all(|n| !n.id.contains("node_modules") && !n.id.contains("min.js") && !n.id.contains("big.py")));
   assert!(g.stats.skipped.iter().any(|s| s.path.ends_with("big.py") && s.reason == SkipReason::TooLarge)); assert!(g.stats.skipped.iter().any(|s| s.reason == SkipReason::Minified)); }
 #[test] fn override_raises_limit() { /* same tmp fixture with indexing.overrides [{path:"**/big.py", max_file_bytes:"4MiB"}] → big.py is indexed, not in skipped */ }
-#[test] fn long_function_chunks() { /* body of 120 statements (~12k chars), ChunkParams{max_tokens:256, overlap:32, max_chunks:32, Syntax}:
+#[test] fn long_function_chunks() { /* reconcile_refunds from the fixture, ChunkParams{max_tokens:256, overlap:32, max_chunks:32, Syntax}:
   pieces.len() > 1; every piece starts with the header; every piece's est_tokens <= 256; consecutive pieces overlap (next.start_line <= prev.end_line);
   the union of line ranges covers the whole body; max_chunks 2 → 2 pieces and truncated == true */ }
 #[test] fn oversized_statement_falls_back_to_lines() { /* one 3k-char statement → several pieces, each within budget */ }
@@ -646,6 +648,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - **In `store::index`**, after relink and outside the main transaction (vector indexes are READ_UNCOMMITTED):
     - **`embed_fingerprint`** = sha256 of `model`, `dimensions`, `metric` and `scalar_kind`. A change sets `rebuild_vectors` and re-embeds everything, including `:Knowledge`. It does **not** trigger a re-parse.
     - **Resolve chunk parameters** with `ChunkParams::resolve(cfg, info.max_sequence_length, info.remote_provider.is_some())` **before** parsing. Pass them to `file_graph`; they're in `parse_fingerprint`.
+    - **No flapping:** `IndexRun` stores the resolved `max_tokens`. When `model_info` is unavailable (transient error, text-only run), `Auto` reuses the last run's stored value instead of the 256 fallback, so a hiccup never forces a full re-parse. The fallback applies only when no run has stored a value yet.
     - **Re-embed only what changed:** `:Chunk` nodes with no `embedding`, or whose `text_hash` differs from their `embedded_hash`, plus every chunk when `rebuild_vectors` is set. `SET c.embedding = $vec, c.embedded_hash = c.text_hash`.
     - **`--full`** always sets `rebuild_vectors`, because deleted nodes don't free vector-index memory until the index is dropped.
     - **`TextOnly`:** skip embedding, and record the reason in `IndexReport.embedding: String`.
@@ -657,8 +660,9 @@ The workspace setup below is already in the repo; only check it. The compose cha
   assert_eq!(m["model_name"], "voyage/voyage-3"); assert_eq!(m["input_type"], "query"); assert_eq!(m["dimensions"], 512); assert!(!m.contains_key("metric") && !m.contains_key("api_base")); }
 #[test] fn disabled_is_text_only() { assert!(matches!(status(&ctx_with("semantic: {embeddings: {enabled: false}}")), EmbedStatus::TextOnly(_))); }
 #[test] #[ignore] fn embeds_chunks_default_model() { /* MAGE image: index fixture → every :Chunk has `embedding` of length 384 and ChunkParams.max_tokens resolved to 256 (all-MiniLM-L6-v2's max_sequence_length);
-  second incremental run re-embeds 0; editing one statement in a long fixture function re-embeds at most 2 chunks (overlap) and none of its other chunks */ }
+  second incremental run re-embeds 0; editing one statement in `reconcile_refunds` re-embeds no chunk that lies wholly before that statement. Greedy packing may shift every later boundary, so later chunks can re-embed; that's expected. */ }
 #[test] #[ignore] fn long_function_found_by_its_tail() { /* fixture function of ~200 lines whose last block mentions "refund ledger"; search over chunk_vec for "refund ledger reconciliation" ranks that function first (Part 2 search uses the same query) */ }
+#[test] #[ignore] fn model_info_failure_does_not_reparse() { /* index once (max_tokens resolved 256 from the model); make model_info fail (test hook) → next incremental run: fingerprint_changed false, changed == 0, warning about text-only */ }
 #[test] #[ignore] fn model_change_rebuilds() { /* change model to another local model with a different dim → vector index recreated with the new dimension; report.changed == 0 (no re-parse) */ }
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine embed`. Expected: FAIL.
@@ -693,6 +697,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `semantic::reconcile(ctx, report: &IndexReport) -> Result<ReconcileReport { stale: usize, orphaned: usize, reattached: usize }>`: runs after commit and does only the hash-based stale marking for surviving anchors. Implements the layer design's §4.3:
     - **Surviving anchors:** recompute `anchor_hash`. If it differs: `status: stale`, `stale_since: run_id`.
     - **`report.vanished`:** if exactly one symbol in the same `unit` has the same `qualname`, re-create the edge to it and mark the entry stale. Otherwise add the `anchor_key` to `orphaned_anchors`; once the entry has no live anchors, set `status: orphaned`.
+    - **Returning code:** for every entry with `orphaned_anchors`, each id that exists again gets its edge re-created and is removed from `orphaned_anchors`. The status becomes `current` if the stored `anchor_hash` matches, else `stale`. Branch switches and file-size-limit round trips therefore restore knowledge instead of losing it.
     - `retracted` entries are skipped.
   - `semantic::export(ctx, dir: &Path) -> Result<usize>`: writes `<dir>/knowledge.jsonl`, one entry per line, with no `:Chunk` data (import recomputes it).
     - Sorted by id. Keys within each object are sorted. Anchors are given by `anchor_key`, never by internal ids or vectors.
@@ -716,6 +721,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   let e = semantic::get(&ctx, &k).unwrap(); assert_eq!(e.status, Status::Current); assert_eq!(e.anchors.len(), 1); }
 #[test] #[ignore] fn stale_on_body_change() { /* summary about pay; edit pay's body; incremental index → status Stale, stale_since == report.run_id; whitespace-only edit → still Current */ }
 #[test] #[ignore] fn reattach_on_move_and_orphan_on_delete() { /* move `charge` to services/orders/app/billing.py → entry re-anchored to the new id, Stale; delete charge entirely → Orphaned with orphaned_anchors == [old id] */ }
+#[test] #[ignore] fn orphan_reattaches_when_code_returns() { /* summary about charge; delete app/main.py → index → Orphaned; restore the file unchanged → index → Current, anchors == [charge id], orphaned_anchors empty; restore it with charge's body changed → Stale */ }
 #[test] #[ignore] fn crash_during_reattach_keeps_anchors() { /* test hook makes reattach_vanished fail → the transaction rolls back: the old nodes, the ABOUT edges and the entry status are all unchanged */ }
 #[test] #[ignore] fn secret_redacted_on_write() { /* body "token=abc123" → stored body contains "token=***" */ }
 #[test] #[ignore] fn import_after_index() { /* export → wipe Memgraph → import before index → Err "run `ops index` first"; index then import → entries Current, anchors attached */ }
