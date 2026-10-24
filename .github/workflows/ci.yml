@@ -4,6 +4,8 @@ on:
   push:
     branches: [develop]
   pull_request:
+    # `labeled` so adding the `embeddings` label runs the embedding tests without a new push.
+    types: [opened, synchronize, reopened, labeled]
   schedule:
     - cron: "0 4 * * 1" # weekly: also runs the embedding tests
 
@@ -57,12 +59,20 @@ jobs:
         env:
           OPS_SEMANTIC__EMBEDDINGS__ENABLED: "false"
         run: cargo test --workspace -- --ignored --skip embed_ --skip pg_ --skip pyright_
+      # Docker created the mounted cache dir as root before any step ran, and Memgraph runs as
+      # uid 101: open it up before the restore (runs as the runner user) and again after it.
+      - name: Make the model cache writable
+        if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'embeddings')
+        run: sudo mkdir -p ~/.cache/huggingface && sudo chmod -R a+rwX ~/.cache/huggingface
       - name: Restore model cache
         if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'embeddings')
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-all-MiniLM-L6-v2
+          key: hf-all-MiniLM-L6-v2 # static: a second model (embed_model_change_rebuilds) downloads each run
+      - name: Keep the restored cache writable
+        if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'embeddings')
+        run: sudo chmod -R a+rwX ~/.cache/huggingface
       - name: Embeddings
         if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'embeddings')
         run: cargo test --workspace -- --ignored embed_

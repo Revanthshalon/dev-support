@@ -6,8 +6,9 @@ services:
     image: memgraph/memgraph-mage:3.14.0
     container_name: memgraph-mage
     ports:
-      - "7687:7687" # Bolt
-      - "7444:7444" # log streaming
+      # Loopback only: the defaults fall back to ops/ops when .env is absent.
+      - "127.0.0.1:7687:7687" # Bolt
+      - "127.0.0.1:7444:7444" # log streaming
     command:
       - --log-level=WARNING
       - --also-log-to-stderr
@@ -51,15 +52,15 @@ services:
         done
         echo "loading embeddings model $$EMBEDDINGS_MODEL"
         q="CALL embeddings.model_info({model_name: '$$EMBEDDINGS_MODEL'}) YIELD info RETURN info;"
-        # Provider errors can echo part of an API key: mask long key-like tokens before printing.
+        # Provider errors can echo part of a key: mask sk-/hf_/Bearer tokens and key=/key: values.
         if out=$$(echo "$$q" | mg 2>&1); then echo "$$out"; else
-          echo "$$out" | sed -E 's/(sk-|key["'"'"']?[=:] *["'"'"']?)[A-Za-z0-9_-]{6,}/\1***/Ig' >&2; exit 1; fi
+          echo "$$out" | sed -E 's#(sk-|hf_|bearer +|key["'"'"']?[=:] *["'"'"']?)[A-Za-z0-9_+/=-]{6,}#\1***#Ig' >&2; exit 1; fi
 
   lab:
     image: memgraph/lab:3.14.0 # same release as memgraph-mage; pinned like it
     container_name: memgraph-lab
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - memgraph
     # Lab's quick-connect is anonymous-only (no username/password setting), and Memgraph has auth on,
