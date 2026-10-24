@@ -717,7 +717,8 @@ The workspace setup below is already in the repo; only check it. The compose cha
 ```rust
 #[test] fn config_map_mapping() { let m = config_map(&ctx_with(r#"semantic: {embeddings: {model: "voyage/voyage-3", dimensions: 512}}"#), InputKind::Query).unwrap();
   assert_eq!(m["model_name"], "voyage/voyage-3"); assert_eq!(m["input_type"], "query"); assert_eq!(m["dimensions"], 512); assert!(!m.contains_key("metric") && !m.contains_key("api_base")); }
-#[test] fn disabled_is_text_only() { assert!(matches!(status(&ctx_with("semantic: {embeddings: {enabled: false}}")), EmbedStatus::TextOnly(_))); }
+#[test] fn disabled_is_text_only() { assert!(matches!(status(&ctx_with("semantic: {embeddings: {enabled: false}}")), EmbedStatus::TextOnly(_)));
+  /* no `semantic:` section, OPS_SEMANTIC__EMBEDDINGS__ENABLED=false set for the test → TextOnly as well (the core CI job relies on this; needs config's try_parsing) */ }
 #[test] #[ignore] fn embed_chunks_default_model() { /* MAGE image: index fixture → every :Chunk has `embedding` of length 384 and ChunkParams.max_tokens resolved to 256 (all-MiniLM-L6-v2's max_sequence_length);
   second incremental run re-embeds 0; editing one statement in `reconcile_refunds` re-embeds no chunk that lies wholly before that statement. Greedy packing may shift every later boundary, so later chunks can re-embed; that's expected. */ }
 #[test] #[ignore] fn embed_long_function_found_by_its_tail() { /* fixture function of ~200 lines whose last block mentions "refund ledger"; search over chunk_vec for "refund ledger reconciliation" ranks that function first (Part 2 search uses the same query) */ }
