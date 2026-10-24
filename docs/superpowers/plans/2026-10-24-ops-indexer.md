@@ -55,12 +55,12 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - **memgraph service:**
     - Bind mounts `./docker/memgraph/lib:/var/lib/memgraph` and `./docker/memgraph/log:/var/log/memgraph`. Remove the named volumes and the top-level `volumes:`.
     - `env_file: [{path: .env, required: false}]`, and `HF_HOME=/var/lib/memgraph/hf-cache`.
-    - `command` adds recovery-on-startup, a snapshot interval of 300 s and snapshot-on-exit. Take the exact flag names from `docker run --rm <image> --help`; don't guess them.
-    - Image pinned to a `memgraph/memgraph-mage` tag ≥ 3.6. Use the 3.14.0 tag if it exists on Docker Hub, else the newest 3.x.
+    - `command`: `--data-recovery-on-startup=true --storage-snapshot-interval-sec=300 --storage-snapshot-on-exit=true` (flag names verified in Memgraph v3.14.0 `src/flags/general.hpp`), plus the existing log flags.
+    - Image pinned to `memgraph/memgraph-mage:3.14.0`.
   - **`embeddings-warmup` service** (`profiles: [embeddings]`):
     - Waits for Bolt, then runs `CALL embeddings.model_info({model_name: $EMBEDDINGS_MODEL}) YIELD info RETURN info;` through `mgconsole`, using the image's own if it has one, else `memgraph/mgconsole`.
     - Exits non-zero on failure.
-  - **`docker-compose.gpu.yml`:** gives the memgraph service `deploy.resources.reservations.devices: [{driver: nvidia, count: all, capabilities: [gpu]}]`.
+  - **`docker-compose.gpu.yml`:** sets the memgraph image to `memgraph/memgraph-mage:3.14.0-relwithdebinfo-cuda`, since the default image's PyTorch is CPU-only, and adds `deploy.resources.reservations.devices: [{driver: nvidia, count: all, capabilities: [gpu]}]`.
   - **`.env.example`:** add every variable in layer-design table (a), commented, with its default.
   - **`.gitignore`:** update the `/docker/` comment to "Memgraph bind mount: data, logs, model cache".
   - **README:** add the Linux `chown` note. Find the uid with `docker run --rm <image> id memgraph`.
@@ -364,7 +364,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 - [ ] **Step 3: Implement.**
   - **Grammars:** `tree_sitter_typescript::LANGUAGE_TYPESCRIPT` for both `.ts` and `.js`, `tree_sitter_html::LANGUAGE`, `tree_sitter_css::LANGUAGE`.
   - **TS symbols:**
-    - `class_declaration`: a decorator `@Component({...})` makes it a `Component`, reading `selector` and `templateUrl` from the object literal. `@Injectable` makes it an `Injectable`.
+    - `class_declaration`: a decorator `@Component({...})` makes it a `Component`. On an **exported** class, the decorator is a child of the enclosing `export_statement`, not of `class_declaration` (verified with tree-sitter-typescript 0.23.2), so check both places. Read `selector` and `templateUrl` from the decorator's object literal. `@Injectable` makes it an `Injectable`.
     - `method_definition` / `function_declaration` / an arrow function assigned to a `const` make Functions or Methods.
     - Constructor parameters with a type annotation, plus `inject(X)`, fill `injects`.
   - **TS HTTP calls:** `this.http.<verb>(arg)` or `<anything named http|httpClient>.<verb>`, where `arg` is a template string or string literal. Run the path through `normalize_path`.
@@ -525,7 +525,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - `store::query(ctx: &Ctx, cypher: &str, params: serde_json::Map<String, Value>) -> Result<Vec<serde_json::Map<String, Value>>>`: synchronous; one map per record, keyed by column. Node → `{"_labels": [...], ...props}` (with `embedding` removed), Relationship → `{"_type": ..., ...props}`, Path → `{"nodes": [...], "rels": [...]}`.
     - `store::query_async(ctx: Ctx, cypher: String, params) -> Result<…>`: `spawn_blocking` around `query`, connecting inside the closure (rsmgclient's `Connection` is not `Send`).
     - `store::ping(ctx: &Ctx) -> Result<()>`
-    - `store::ensure_indexes(ctx: &Ctx, labels: &[&str]) -> Result<()>`: **autocommit**, outside any transaction. Creates `:<Label>(id)` and `:<Label>(workspace)`. Memgraph rejects index changes inside multi-statement transactions; confirm in its docs. "Already exists" errors are ignored.
+    - `store::ensure_indexes(ctx: &Ctx, labels: &[&str]) -> Result<()>`: **autocommit**, outside any transaction. Creates `:<Label>(id)` and `:<Label>(workspace)`. Memgraph rejects index changes inside multi-statement transactions (`MulticommandTxException`: "… is not allowed in multicommand transactions", verified at v3.14.0). "Already exists" errors are ignored.
   - `lock::IndexLock::acquire(ctx: &Ctx, wait: Duration) -> Result<IndexLock>`: takes `.ops/index.lock`, holding `{pid, started_at}`. A lock whose pid is dead is taken over. Returns `Err("index in progress (pid N, since T)")` once `wait` runs out. The lock is released on drop.
   - `enum IndexMode { Incremental, Full }`
   - `store::IndexReport { mode, added, changed, deleted, unchanged, nodes, edges, unresolved_calls, fingerprint_changed: bool, vanished: Vec<VanishedAnchor>, run_id: String, skipped: Vec<Skipped>, chunks: usize, chunks_truncated: usize }`
@@ -558,7 +558,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `Connection::connect`, `execute`, `fetchall`, `commit`, `rollback`
   - the `QueryParam` and `Value` variants
 
-  Write the JSON ↔ `QueryParam`/`Value` converters to match what you find.
+  Write the JSON ↔ `QueryParam`/`Value` converters to match what you find. (Verified in 4.0.0: `QueryParam` has `Null Bool Int Float String List Map` plus temporal and point types; `ConnectParams` has `autocommit`; `Connection` has `rollback`.) Call `Connection::init()` once per process before the first connect.
 - [ ] **Step 2: Failing tests**
 ```rust
 #[test] fn json_param_round_trip() { /* json!({"a":[1,"x",{"b":true}],"n":null}) → QueryParam::Map(...) with nested List/Map/Null (pure) */ }
@@ -642,7 +642,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `enum EmbedStatus { Vector(ModelInfo), TextOnly(String /* reason */) }`, and `embed::status(ctx) -> EmbedStatus`. Gives `TextOnly` when `enabled` is false, the `embeddings` module is absent (`CALL mg.procedures()` has no `embeddings.text`), or `model_info` fails.
   - `embed::embed_texts(ctx, texts: &[String], kind: InputKind) -> Result<Vec<Vec<f32>>>` via `CALL embeddings.text($texts, $cfg)`, in chunks of 256.
   - `embed::ensure_search_indexes(ctx, info: Option<&ModelInfo>, rebuild_vectors: bool) -> Result<()>`. Autocommit.
-    - Text indexes: `knowledge_text ON :Knowledge`, `chunk_text ON :Chunk`, and `code_text` on each code label's `card` (one index per label if `CREATE TEXT INDEX` takes one label).
+    - Text indexes: `knowledge_text ON :Knowledge(title, body)`, `chunk_text ON :Chunk(text)`, and `card_text_<label> ON :<Label>(card)` per code label. The grammar takes one label plus an optional property list.
     - Vector index, when `info` is Some: a single `chunk_vec ON :Chunk(embedding)`, with `{dimension, capacity: max(1024, 2 × chunk count), metric, scalar_kind}`. There are no per-symbol or per-entry vectors.
     - `rebuild_vectors` drops them first.
   - **In `store::index`**, after relink and outside the main transaction (vector indexes are READ_UNCOMMITTED):
@@ -689,7 +689,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - Validates: title ≤ 120 chars, body ≤ 8 KiB, evidence ≤ 20 items, at least one anchor (flow: ≥ 2 steps; relation: from and to).
     - Redacts `title`, `body` and `evidence`.
     - Writes `:Knowledge {…, workspace, layer:'semantic'}` plus `ABOUT/STEP{order}/FROM/TO {anchor_key, anchor_hash}` edges. When `embed::status` is `Vector`, it then writes the entry's chunks: `chunk::split` with header `title + tags` and body `body`, as `:Chunk {id: chunk:{k_id}:{ord}, layer:'semantic'}-[:CHUNK_OF]->(k)`, and embeds them. `revise` writes chunks for the new entry; a retracted entry keeps its chunks, and search filters them out.
-    - Retries up to 3 times on a Memgraph transaction conflict (match the error text from Memgraph's docs).
+    - Retries up to 3 times on a Memgraph transaction conflict, matching the error text "Cannot resolve conflicting transactions" (verified at v3.14.0).
   - `semantic::get(ctx, id) -> Result<Entry>`, and `semantic::about(ctx, node_ids: &[String], include_stale: bool) -> Result<Vec<Entry>>`: entries anchored (`ABOUT`/`STEP`/`FROM`/`TO`) to any of the nodes, excluding `retracted`.
   - `semantic::revise(ctx, id, patch: Patch) -> Result<String>`: a new entry that `SUPERSEDES` the old one; the old one gets `status: retracted`.
   - `semantic::retract(ctx, id, reason) -> Result<()>`: sets `status: retracted` and appends the reason. It never deletes.

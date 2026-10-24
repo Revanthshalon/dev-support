@@ -348,8 +348,9 @@ Changing them re-chunks everything on the next run. A model swap that keeps the 
 - `chunk_vec ON :Chunk(embedding)`, one vector index for code and knowledge chunks, filtered by
   `CHUNK_OF` target and `layer` at query time.
   `metric: "cos"`, `dimension` from `embeddings.model_info`, `capacity` = 2 × the current count.
-- Text indexes: `knowledge_text ON :Knowledge`, `chunk_text ON :Chunk`, plus one per code label (on `card`). *Builder: confirm whether
-  `CREATE TEXT INDEX` takes several labels; if not, create one per label.*
+- Text indexes: `knowledge_text ON :Knowledge(title, body)`, `chunk_text ON :Chunk(text)`, and one
+  `card_text_<label> ON :<Label>(card)` per code label. Memgraph's grammar takes exactly one label
+  and an optional property list: `CREATE TEXT INDEX name ON :Label(props…)` (verified at v3.14.0).
 
 **Querying:**
 1. `embeddings.text([query])`.
@@ -399,9 +400,11 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d   # local m
   exits non-zero (with the redacted error) if the model can't load or the key is rejected.
   *Builder: confirm `mgconsole` is in the `memgraph-mage` image; if not, use the `memgraph/mgconsole`
   image for this service.*
-- **`docker-compose.gpu.yml`** adds `deploy.resources.reservations.devices: [{driver: nvidia,
-  count: all, capabilities: [gpu]}]` to the memgraph service. It needs the NVIDIA Container
-  Toolkit on the host. Docker Desktop on macOS has no GPU passthrough, so local models run on CPU
+- **`docker-compose.gpu.yml`** switches the memgraph service to the CUDA image
+  `memgraph/memgraph-mage:3.14.0-relwithdebinfo-cuda` (amd64 only) and adds
+  `deploy.resources.reservations.devices: [{driver: nvidia, count: all, capabilities: [gpu]}]`.
+  The default image ships a CPU-only PyTorch build, so reserving the GPU alone wouldn't use it.
+  It needs the NVIDIA Container Toolkit on the host. Docker Desktop on macOS has no GPU passthrough, so local models run on CPU
   there.
 
 **(b) Per call: `ops.yaml` `semantic.embeddings`** (ops-support passes these as the configuration
@@ -459,16 +462,14 @@ semantic:
 - **Fallback:** if the `embeddings` module is missing (a non-MAGE image) or the model won't load,
   `recall` and `search_code` use text search only and say so. `ops check` reports which mode is
   active.
-- **Image:** pin `memgraph/memgraph-mage` to a release ≥ 3.6 instead of `latest`. *Builder:
-  confirm the exact tag for 3.14.0 on Docker Hub.*
+- **Image:** pin `memgraph/memgraph-mage:3.14.0` (published for amd64 and arm64), not `latest`.
 
 ### 4.6 Client integration
-- Both clients connect to the same stdio server. `ops init` writes:
-  - `.mcp.json` for Claude Code (as today).
-  - The Copilot CLI MCP config. *Builder: confirm Copilot CLI's config location and format
-    (user-level `~/.copilot/mcp-config.json`, and whether a workspace-level file is supported)
-    against current Copilot CLI docs. If only user-level exists, `ops init` prints the snippet
-    instead of editing the user's home directory.*
+- Both clients connect to the same stdio server through **one file**: `ops init` writes `.mcp.json` at
+  the workspace root (`{"mcpServers": {"ops": {...}}}`). Claude Code reads it, and so does Copilot CLI,
+  which loads project-level `.mcp.json` from the working directory up to the repository root
+  (GitHub Docs, "Adding MCP servers for GitHub Copilot CLI"). `ops init` never edits the user-level
+  `~/.copilot/mcp-config.json`.
 - `author_client` comes from MCP `initialize.clientInfo.name`, normalized (`claude-code`,
   `copilot-cli`, else the raw name). `author_model` is an optional tool argument.
 - Optional: `ops init --agent-instructions` appends a short block to `AGENTS.md` / `CLAUDE.md`
