@@ -26,6 +26,8 @@ So:
   wrote it, when, from what evidence, and with what confidence.
 - The semantic layer is **anchored to code by stable keys** (no line numbers) and tracks drift:
   `current → stale` when the code it describes changes, `orphaned` when the code disappears.
+- **Search by meaning** over both the semantic layer and the code, using Memgraph's native
+  embeddings, vector and full-text indexes (Community edition), with no ML dependency in ops-support.
 - Everything existing tools return (`code_context`, `trace_flow`, `service_map`, `contract`)
   includes the relevant semantic entries, with stale ones flagged.
 
@@ -34,7 +36,8 @@ So:
   as Markdown files. They are the first reference for future incidents (see "Incident reports"
   below). They are not graph nodes.
 - No LLM inside ops-support. The semantic layer is produced by the client's LLM.
-- No embeddings or vector search in this iteration. Recall is by graph anchor and text match.
+- No embedding model inside ops-support itself. Embeddings, vector search and full-text search
+  are native Memgraph features (§4.5); ops-support only calls them.
 
 ## Anti-goals (a failure even if it technically works)
 - A re-index or code edit that deletes or rewrites semantic entries.
@@ -179,7 +182,8 @@ rather than the server re-indexing on its own mid-investigation.)*
 | `remember(kind, title, body, anchors: [id_or_name], evidence, confidence, tags?, steps?/from?/to?)` | Create an entry. Anchors resolve like `find_symbol`; ambiguous or unknown anchors are an error. Returns the id. |
 | `revise(id, body?, title?, confidence?, evidence?, anchors?)` | Create a new entry that SUPERSEDES the old one (the old one becomes `retracted`). Also how a `stale` entry gets re-confirmed. |
 | `retract(id, reason)` | `status: retracted`, with the reason appended. Never a hard delete. |
-| `recall(target? , query?, kinds?, include_stale?)` | Entries about a node (and its 1-hop neighbourhood), or a text match over title/body/tags. `current` by default. |
+| `recall(target? , query?, kinds?, include_stale?, k?)` | Entries about a node (and its 1-hop neighbourhood), and/or a **semantic + text search** over entries (§4.5). `current` by default. |
+| `search_code(query, service?, kinds?, k?)` | Find code by meaning ("where do we charge the card") over code cards (§4.5). Each hit comes with its attached current knowledge. |
 | `knowledge_gaps(service?, kinds?)` | Structural nodes with no current `summary` (ranked by fan-in, route handlers and entrypoints first), plus every `stale` and `orphaned` entry. This drives enrichment. |
 
 - All five go through `run_tool` (audit) and `redact`. `body` and `evidence` are size-checked.
@@ -234,7 +238,82 @@ for the re-attach and orphan rules above. An orphaned entry keeps `anchor_key` i
   deterministic, so diffs show only the entries that changed. Since it's committed, redaction on
   write (§4.2) is the guard against secrets reaching git.
 
-### 4.5 Client integration
+### 4.5 Semantic search (native Memgraph)
+Memgraph provides all three pieces, so ops-support adds no ML dependency:
+- **Vector indexes:** `CREATE VECTOR INDEX … WITH CONFIG {dimension, capacity, metric}` and
+  `vector_search.search`. Production-ready since Memgraph 3.2.
+- **Embeddings, computed inside Memgraph:** the MAGE `embeddings` module. Its local backend runs a
+  SentenceTransformer model (default `all-MiniLM-L6-v2`) in the Memgraph process; its remote backend
+  calls a provider through LiteLLM. `embeddings.text([...])` returns vectors for given strings.
+- **Full-text indexes:** `CREATE TEXT INDEX` and `text_search.search`. Non-experimental since 3.6.
+
+**Edition: all three are in the free Community edition.** They're absent from Memgraph's
+Enterprise-only feature list. The implementing sources (`vector_index.cpp`, `text_index.cpp`,
+`src/mage/python/embeddings.py`) are BSL 1.1, which is the Community licence; Enterprise code carries
+an MEL header. BSL is source-available: free to use, including commercially, but you may not offer
+Memgraph as a hosted database service. Self-hosting for ops-support is fine. Checked against
+Memgraph's docs and repo at v3.14.0.
+
+**What gets embedded**
+
+| Node | Text that gets embedded | When |
+|---|---|---|
+| `:Knowledge` | `title + body + tags` | on `remember` / `revise` |
+| Function, Class, Component, Injectable, Schema, Route | a **code card**: kind, qualname, signature, docstring, decorators/route, log templates, file path. Stored as the `card` property. | on index, for added/changed nodes only (when `card` changed) |
+
+- ops-support calls `embeddings.text([...])` itself and `SET`s `n.embedding`. It doesn't use
+  `node_sentence`, which embeds every string property.
+- Text is already redacted when it's embedded.
+- The Part 1 extractors also capture docstrings / JSDoc for the card.
+
+**Indexes** (created idempotently in autocommit before each index run, like the other indexes):
+- `knowledge_vec ON :Knowledge(embedding)` and `code_vec ON :Function|Class|Component|Injectable|Schema|Route(embedding)`.
+  `metric: "cos"`, `dimension` from `embeddings.model_info`, `capacity` = 2 × the current count.
+- Text indexes: `knowledge_text ON :Knowledge`, plus one per code label. *Builder: confirm whether
+  `CREATE TEXT INDEX` takes several labels; if not, create one per label.*
+
+**Querying:**
+1. `embeddings.text([query])`.
+2. `vector_search.search(index, k*3, vec)` and `text_search.search(index, query)`.
+3. Merge the two with reciprocal-rank fusion.
+4. Boost hits within 2 hops of `target` / `service`.
+5. Drop `retracted` hits, and flag `stale` ones.
+
+**Configuration** (new `semantic:` section in `ops.yaml`):
+```yaml
+semantic:
+  embeddings:
+    backend: local                 # local | remote
+    model: all-MiniLM-L6-v2        # local: any SentenceTransformer name; remote: a LiteLLM model id
+    api_base: null                 # remote only
+```
+- Remote-provider credentials are read **by the Memgraph process**, so they go in the compose
+  service's environment from `.env`, never in `ops.yaml`.
+- `backend` and `model` are part of the index fingerprint (§3). Changing either drops and recreates
+  the vector indexes and re-embeds every card and entry.
+
+**Operational notes (from Memgraph's docs)**
+- Deleting nodes doesn't free vector-index memory until the index is dropped. `ops index --full`
+  drops and recreates the vector indexes. `ops check` warns when an index holds over 2× as many
+  vectors as there are live nodes.
+- Vector indexes are `READ_UNCOMMITTED`, and the query planner never uses them. All vector access
+  goes through `vector_search.*` in ops-support's own Cypher, so `graph_query` still rejects `CALL`.
+- Snapshots and the WAL store vector values. The docs don't say whether index *definitions* are
+  restored on restart; the idempotent creation before each run covers that either way.
+- The local backend downloads the model from Hugging Face on first use. Set `HF_HOME` in the
+  memgraph service to a path on the bind mount (`/var/lib/memgraph/hf-cache`), so it downloads
+  once. Air-gapped setups pre-seed that directory or use `backend: remote`.
+- Set `omit_vector_index_properties_on_return`, and strip `embedding` in `store::query` too, so
+  vectors never appear in tool output.
+- The export (§4.4) leaves vectors out. They're recomputed on import, which keeps git diffs
+  readable.
+- **Fallback:** if the `embeddings` module is missing (a non-MAGE image) or the model won't load,
+  `recall` and `search_code` use text search only and say so. `ops check` reports which mode is
+  active.
+- **Image:** pin `memgraph/memgraph-mage` to a release ≥ 3.6 instead of `latest`. *Builder:
+  confirm the exact tag for 3.14.0 on Docker Hub.*
+
+### 4.6 Client integration
 - Both clients connect to the same stdio server. `ops init` writes:
   - `.mcp.json` for Claude Code (as today).
   - The Copilot CLI MCP config. *Builder: confirm Copilot CLI's config location and format
@@ -272,6 +351,8 @@ for the re-attach and orphan rules above. An orphaned entry keeps `anchor_key` i
   - `diagnose` step 0.
   - `save_incident_report` / `find_incident_reports`.
   - Staleness info on graph tools, and `reindex`.
+- Part 1 extractors: capture docstrings / JSDoc. New task: code cards, embedding on index, vector and text indexes. Part 2: `search_code`, vector-backed `recall`, `ops check` embedding status.
+- `docker-compose.yml`: pin the MAGE image (≥ 3.6), set `HF_HOME` on the bind mount.
 - New dependencies: a hash crate (`sha2`, already in the tree through sqlx), a file watcher
   (`notify`), and `uuid`, each passing `cargo deny`.
 
@@ -283,10 +364,10 @@ for the re-attach and orphan rules above. An orphaned entry keeps `anchor_key` i
   overwriting.
 - Agent instructions in `AGENTS.md`/`CLAUDE.md` are opt-in (`ops init --agent-instructions`).
 - The semantic tools are in every mode, including the MVP.
-- No embeddings or vector search yet.
+- Semantic search is hybrid (vector + full text, rank-fused, graph-boosted), all computed by
+  Memgraph. Vectors are left out of the committed export and recomputed on import.
 
 ## What's left to the builder
 - Exact Cypher for subgraph replacement and relinking; batch sizes.
 - Debounce details and ignore-file handling in `ops watch`.
-- The text-match strategy for `recall` (case-insensitive substring over title/body/tags is enough
-  to start).
+- Fusion constant and graph-boost weights for search ranking (RRF with k=60 is a fine start).
