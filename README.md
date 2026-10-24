@@ -76,6 +76,7 @@ docs/superpowers/       design spec and implementation plans
 | Docker + compose | local Memgraph | Docker Desktop / docker-ce |
 | cargo-deny | dependency audit | `cargo install --locked cargo-deny` |
 | kubectl *(optional)* | Kubernetes log source | `brew install kubectl` |
+| git *(optional)* | `recent_changes` (read-only) | `xcode-select --install` / `apt install git` |
 | Language servers *(optional)* | `lsp` tool | `npm i -g pyright typescript-language-server typescript` |
 
 > **macOS:** `rsmgclient`'s build script looks for OpenSSL **only** under
@@ -157,6 +158,11 @@ logging:                                            # optional; these are the de
   dir: .ops/logs                                    # rotated daily: ops-mcp.*.jsonl, ops.*.jsonl, audit.*.jsonl
   retention_days: 14
   audit: true                                       # one redacted record per MCP tool call
+correlation:                                        # optional; request_timeline
+  patterns: [ ... ]                                 # regexes with a named group `id`; defaults cover request/trace/correlation ids, x-request-id and W3C traceparent
+  clock_skew_ms: 500                                # cross-service gaps under this are flagged order_uncertain
+changes:
+  since: 7d                                         # default look-back for recent_changes (max 90d)
 ```
 
 Override any value without editing the file using `OPS_`-prefixed env vars, with `__` between
@@ -310,7 +316,8 @@ mitigation and fix, a checklist to validate the resolution, prevention, and a ru
 - **`read_file` and `lsp`** read only configured service, library and contract paths, compose files and
   Dockerfiles. `.env*`, `.ops/` and `ops.yaml` are always denied.
 - **Kubernetes** calls are limited to `kubernetes.namespaces`. Arguments from the LLM are never
-  passed through a shell.
+  passed through a shell. `git`, `docker` and `kubectl` run read-only as argv, and `recent_changes`
+  never returns diff text.
 - **Every tool call is audited** to `.ops/logs/audit.*.jsonl`: tool, redacted arguments (SQL and
   commands included), outcome, duration, backends touched and result size. Result content is never
   recorded.
