@@ -54,7 +54,9 @@ onto the code flow, checks configuration, and inspects datastores read-only.
 Cargo.toml              workspace: shared versions, lints
 deny.toml               dependency audit policy (cargo-deny)
 docker-compose.yml      Memgraph + Memgraph Lab; data bind-mounted at docker/memgraph/
-docker-compose.gpu.yml  optional GPU override for local embedding models (planned)
+docker-compose.gpu.yml  optional GPU override for local embedding models
+Makefile                env / up / warmup / down shortcuts over docker compose
+scripts/                embeddings-warmup.sh, run by the embeddings-warmup service
 .env.example            credentials template (copy to .env)
 services/
   engine/               library: config, discovery, parsing, graph, store, logs, datastores, LSP
@@ -86,11 +88,19 @@ docs/superpowers/       design spec and implementation plans
 ### First run
 
 ```sh
-cp .env.example .env              # set MEMGRAPH_USER / MEMGRAPH_PASSWORD
-docker compose up -d              # Memgraph on :7687, Lab UI on http://localhost:3000
+cp .env.example .env              # or `make env`; set MEMGRAPH_USER / MEMGRAPH_PASSWORD now
+docker compose up -d              # or `make up`; Memgraph on 127.0.0.1:7687, Lab on http://localhost:3000
 cargo build --workspace
 cargo deny check                  # must pass before any dependency change is merged
 ```
+
+> [!IMPORTANT]
+> Memgraph creates its user from `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` **on the first start only**.
+> Changing them in `.env` later doesn't change the stored user; change it with Cypher
+> (`ALTER USER … SET PASSWORD …`) or delete `docker/memgraph/` to start over.
+
+The `Makefile` wraps the same commands: `make env` (creates `.env`, never overwrites), `make up`,
+`make up-embeddings`, `make up-gpu`, `make warmup`, `make down`, `make logs`.
 
 **Memgraph Lab** (<http://localhost:3000>): choose *Connect manually* and enter host `memgraph`
 (not `localhost` or `127.0.0.1`: Lab connects from inside its container, where those mean Lab
@@ -102,8 +112,10 @@ cache, `log/` for logs; git-ignored). It survives `docker compose down` and rest
 snapshots every 5 minutes and on exit, and recovers on startup. Delete `docker/memgraph/` to start
 from an empty graph.
 
-`docker compose --profile embeddings up -d` also runs `embeddings-warmup`, which loads
-`EMBEDDINGS_MODEL` up front and fails loudly on a bad model name or provider key. For local
+`make warmup` (or `docker compose --profile embeddings run --rm embeddings-warmup`) loads
+`EMBEDDINGS_MODEL` up front and exits non-zero on a bad model name or provider key. The script is
+[`scripts/embeddings-warmup.sh`](scripts/embeddings-warmup.sh). With `--profile embeddings up -d` it
+runs in the background instead, and its result is only in `docker compose logs embeddings-warmup`. For local
 models on NVIDIA GPUs, add `-f docker-compose.yml -f docker-compose.gpu.yml`.
 
 > [!NOTE]
