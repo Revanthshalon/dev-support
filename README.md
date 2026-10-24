@@ -92,8 +92,9 @@ cargo build --workspace
 cargo deny check                  # must pass before any dependency change is merged
 ```
 
-**Memgraph Lab** (<http://localhost:3000>): choose *Connect manually* and enter host `memgraph`,
-port `7687`, and `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` from `.env`. Quick-connect is turned off
+**Memgraph Lab** (<http://localhost:3000>): choose *Connect manually* and enter host `memgraph`
+(not `localhost` or `127.0.0.1`: Lab connects from inside its container, where those mean Lab
+itself), port `7687`, and `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` from `.env`. Quick-connect is turned off
 because it can't send credentials and Memgraph has auth on.
 
 Memgraph data is bind-mounted at `docker/memgraph/` (`lib/` for data and the embedding-model
