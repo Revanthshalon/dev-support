@@ -69,7 +69,7 @@ One mode per process. To use several, register the server several times.
 | | `redis_command` | Allow-listed read-only Redis commands |
 | | `datastore_health` | Connections, long queries and locks (Postgres); memory, evictions and clients (Redis) |
 | Semantic layer | `recall` | Knowledge about a node and its neighbours, or search by meaning (vector + text) |
-| | `search_code` | Find code by meaning ("where do we take payment") |
+| | `search_code` | Find code by meaning ("where do we take payment"), with `match_lines` pointing to the matching part of long functions |
 | | `knowledge_gaps` | Important code with no summary yet, plus stale and orphaned entries |
 | | `remember` / `revise` / `retract` | Record, update (keeping history) or withdraw an entry: summary, concept, flow, relation, invariant, gotcha, ops note, always with evidence and confidence |
 | Index | `reindex` | Incremental re-index on request; reports "index in progress" if another indexer runs |

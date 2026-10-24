@@ -43,7 +43,8 @@ binaries are thin layers over this crate.
 | `graph` | Builds the service graph: code, docker, contracts, `BOUNDARY` summaries | P1·6 |
 | `store`, `lock` | Memgraph through `rsmgclient`: incremental index (upsert, relink, one transaction), query, ping; single-writer `.ops/index.lock` | P1·7 |
 | `watch` | `ops watch`: debounced file watcher → incremental index | P1·7b |
-| `embed` | Code cards and knowledge embedded by Memgraph's MAGE `embeddings` module; vector and text indexes; text-only fallback | P1·7c |
+| `chunk` | Splits long symbols and knowledge into overlapping, statement-aligned chunks within the model's token limit | P1·6 |
+| `embed` | Code chunks and knowledge chunks embedded by Memgraph's MAGE `embeddings` module; vector and text indexes; text-only fallback | P1·7c |
 | `semantic` | The knowledge layer: create, revise, retract, recall by anchor; drift reconciliation; `ops knowledge export/import` | P1·7d |
 | `telemetry` | `tracing` setup: stderr plus rotated files, redacting writer | P2·8a |
 | `codeq` | Graph and code queries; read-only Cypher guard; `read_file` path allow-list; index staleness | P2·8 |
@@ -67,6 +68,7 @@ binaries are thin layers over this crate.
 
 (:Knowledge {kind, status: current|stale|orphaned|retracted})-[:ABOUT | STEP | FROM | TO]->(any structural node)
 (:IndexRun)                                 one per index run (parse and embed fingerprints)
+(:Chunk)-[:CHUNK_OF]->(symbol | :Knowledge)   embedded pieces; search scores a symbol by its best chunk
 ```
 
 The spec has the full model, including properties and node ids.
