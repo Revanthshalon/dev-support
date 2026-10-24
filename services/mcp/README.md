@@ -54,19 +54,22 @@ One mode per process. To use several, register the server several times.
 
 | Group | Tool | Purpose |
 |---|---|---|
-| Graph and code | `service_map` | Services, datastores, and boundaries between services with evidence (contract, shared lib, compose, http) |
+| Graph and code | `service_map` | Services, datastores, and boundaries between services with evidence (contract, shared lib, compose, http, queue, table). With `focus`, `direction` and `depth`, the blast radius: what depends on a node, or what it needs |
 | | `contract` | A contract's endpoints and implementations, the schemas and their users, and undeclared calls |
 | | `find_symbol` / `code_context` | Locate a function or class; get its source, callers, callees, routes, logs and env reads |
-| | `trace_flow` | Call paths up to entrypoints and routes, or down to leaves, across service boundaries |
+| | `trace_flow` | Call paths up to entrypoints and routes, or down to leaves, across service boundaries and through queues (API → worker) |
 | | `read_file` | Read code inside configured paths only |
 | | `graph_query` | Read-only Cypher |
 | | `lsp` | Definition, references and hover from the service's language server |
+| Execution flow | `error_paths` | How an error travels from its raise site: handled, logged, swallowed, re-raised, or escaping as an HTTP status or a failed (or retried) job. Each hop says whether it's `exact`, `by_name`, `catch_all` or `unknown` |
+| | `request_timeline` | One cross-service timeline of a request from logs, by correlation id or time window, each line mapped to code; gaps under `correlation.clock_skew_ms` are flagged `order_uncertain` |
+| | `recent_changes` | Recent git commits mapped onto functions, routes and config files (default `changes.since: 7d`, max 90d); never returns diff text |
 | Operations | `fetch_logs` | Logs from compose, Kubernetes (allow-listed namespaces), files or a command |
 | | `match_log` | Log line or traceback → the function that emitted it, and its caller chain |
 | | `analyze_logs` | Cluster warnings and errors across services and map each cluster to code |
-| | `compose_status` / `k8s_status` | Container and pod state: restarts, OOMKilled, CrashLoopBackOff, warning events |
+| | `compose_status` / `k8s_status` | Container and pod state: restarts, OOMKilled, CrashLoopBackOff, warning events; image and start time per container, and deployment revisions with an image timeline |
 | | `service_config` / `check_config` | Redacted config view; findings such as missing env vars or port mismatches, with `file:line` |
-| Data | `db_query` / `db_schema` | Read-only PostgreSQL |
+| Data | `db_query` / `db_schema` | Read-only PostgreSQL; `db_schema` also lists the code that reads or writes each table |
 | | `redis_command` | Allow-listed read-only Redis commands |
 | | `datastore_health` | Connections, long queries and locks (Postgres); memory, evictions and clients (Redis) |
 | Semantic layer | `recall` | Knowledge about a node and its neighbours, or search by meaning (vector + text) |
@@ -81,11 +84,11 @@ One mode per process. To use several, register the server several times.
 
 | Prompt | Use it to |
 |---|---|
-| `diagnose(problem)` | Run the full investigation, starting from past incident reports and recalled knowledge. Classify the root cause (operational procedure, misconfiguration, datastore, code bug or infrastructure), and record durable facts learned along the way |
-| `triage_logs(service)` | Summarize what's going wrong in one service's logs |
-| `explain_flow(entry)` | Walk a route, function or UI event through the code |
+| `diagnose(problem)` | Run the full investigation, starting from past incident reports and recalled knowledge, then recent changes, the request timeline, error paths and the blast radius. Classify the root cause (operational procedure, misconfiguration, datastore, code bug or infrastructure), and record durable facts learned along the way |
+| `triage_logs(service)` | Summarize what's going wrong in one service's logs, and suggest `request_timeline` for the noisiest request ids |
+| `explain_flow(entry)` | Walk a route, function or UI event through the code, across queues, including its error paths |
 | `check_misconfiguration(service)` | Hunt for config and environment problems |
-| `investigate_datastore(datastore, symptom)` | Dig into a Postgres or Redis symptom |
+| `investigate_datastore(datastore, symptom)` | Dig into a Postgres or Redis symptom, using the code that touches the table and recent migrations |
 | `write_rca(findings)` | Produce an incident report from [`templates/incident-report.md`](templates/incident-report.md), then save it with `save_incident_report` |
 | `enrich_knowledge(scope)` | Work through `knowledge_gaps`: read the code, then `remember` summaries, flows, relations and gotchas, or `revise` stale entries |
 
@@ -102,6 +105,8 @@ validate the resolution, prevention, and a five-minute runbook entry.
   always denied.
 - Kubernetes access is limited to `kubernetes.namespaces`. Arguments are never passed through a
   shell.
+- `git`, `docker` and `kubectl` run read-only, as argv. `recent_changes` validates `since` and
+  `path`, and returns commit subjects (redacted), file names and line ranges, never diff text.
 - Writes to Memgraph happen only through `remember` / `revise` / `retract` (schema-checked, size-capped,
   redacted) and `reindex`. `graph_query` stays read-only, and knowledge is never hard-deleted.
 - stdout carries only MCP protocol messages. Diagnostics go to stderr and `.ops/logs/`.
