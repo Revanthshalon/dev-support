@@ -4,6 +4,8 @@ on:
   push:
     branches: [develop]
   pull_request:
+  schedule:
+    - cron: "0 4 * * 1" # weekly: also runs the embedding tests
 
 jobs:
   deny:
@@ -25,3 +27,42 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  # Memgraph-backed tests (`#[ignore]`). Naming rule: `embed_*` needs an embedding model,
+  # `pg_*` Postgres, `pyright_*` pyright; the last two stay manual.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      memgraph:
+        image: memgraph/memgraph-mage:3.14.0
+        ports:
+          - 7687:7687
+        env:
+          MEMGRAPH_USER: ops
+          MEMGRAPH_PASSWORD: ops
+          HF_HOME: /hf-cache
+        volumes:
+          - /home/runner/.cache/huggingface:/hf-cache
+    env:
+      MEMGRAPH_USER: ops
+      MEMGRAPH_PASSWORD: ops
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake libssl-dev clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Wait for Bolt
+        run: for i in $(seq 60); do nc -z localhost 7687 && exit 0; sleep 2; done; echo "memgraph not up" >&2; exit 1
+      - name: Core (text-only, no model download)
+        env:
+          OPS_SEMANTIC__EMBEDDINGS__ENABLED: "false"
+        run: cargo test --workspace -- --ignored --skip embed_ --skip pg_ --skip pyright_
+      - name: Restore model cache
+        if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'embeddings')
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-all-MiniLM-L6-v2
+      - name: Embeddings
+        if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'embeddings')
+        run: cargo test --workspace -- --ignored embed_

@@ -1,19 +1,59 @@
-# Local Memgraph for ops-support. Credentials come from .env (see .env.example).
-# Data lives in named volumes and survives `docker compose down`; only `down -v` deletes it.
+# Local Memgraph for ops-support. Credentials and embedding-provider keys come from .env
+# (see .env.example). Data is bind-mounted under ./docker/memgraph/ and survives
+# `docker compose down`; delete that directory to start from an empty graph.
 services:
   memgraph:
-    image: memgraph/memgraph-mage:latest
+    image: memgraph/memgraph-mage:3.14.0
     container_name: memgraph-mage
     ports:
       - "7687:7687" # Bolt
       - "7444:7444" # log streaming
-    command: ["--log-level=WARNING", "--also-log-to-stderr", "--storage-properties-on-edges=true"]
+    command:
+      - --log-level=WARNING
+      - --also-log-to-stderr
+      - --storage-properties-on-edges=true
+      - --data-recovery-on-startup=true
+      - --storage-snapshot-interval-sec=300
+      - --storage-snapshot-on-exit=true
     volumes:
-      - memgraph_data:/var/lib/memgraph
-      - memgraph_log:/var/log/memgraph
+      - ./docker/memgraph/lib:/var/lib/memgraph
+      - ./docker/memgraph/log:/var/log/memgraph
+    # The whole .env reaches Memgraph, so LiteLLM inside it sees provider keys (OPENAI_API_KEY, …).
+    env_file:
+      - path: .env
+        required: false
     environment:
       - MEMGRAPH_USER=${MEMGRAPH_USER:-ops}
       - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD:-ops}
+      - HF_HOME=/var/lib/memgraph/hf-cache # model cache on the bind mount: downloads once
+
+  # One-shot: `docker compose --profile embeddings up -d` loads EMBEDDINGS_MODEL now (downloading
+  # it if needed) and checks the provider key, instead of failing at the first `ops index`.
+  embeddings-warmup:
+    image: memgraph/mgconsole:1.7.1
+    profiles: [embeddings]
+    depends_on:
+      - memgraph
+    restart: "no"
+    environment:
+      - MEMGRAPH_USER=${MEMGRAPH_USER:-ops}
+      - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD:-ops}
+      - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL:-all-MiniLM-L6-v2}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mg() { mgconsole --host memgraph --port 7687 --username "$$MEMGRAPH_USER" --password "$$MEMGRAPH_PASSWORD"; }
+        i=0
+        until echo 'RETURN 1;' | mg >/dev/null 2>&1; do
+          i=$$((i + 1)); [ "$$i" -ge 60 ] && { echo "memgraph not reachable on bolt after 120s" >&2; exit 1; }
+          sleep 2
+        done
+        echo "loading embeddings model $$EMBEDDINGS_MODEL"
+        q="CALL embeddings.model_info({model_name: '$$EMBEDDINGS_MODEL'}) YIELD info RETURN info;"
+        # Provider errors can echo part of an API key: mask long key-like tokens before printing.
+        if out=$$(echo "$$q" | mg 2>&1); then echo "$$out"; else
+          echo "$$out" | sed -E 's/(sk-|key["'"'"']?[=:] *["'"'"']?)[A-Za-z0-9_-]{6,}/\1***/Ig' >&2; exit 1; fi
 
   lab:
     image: memgraph/lab:latest
@@ -25,7 +65,3 @@ services:
     environment:
       - QUICK_CONNECT_MG_HOST=memgraph
       - QUICK_CONNECT_MG_PORT=7687
-
-volumes:
-  memgraph_data:
-  memgraph_log:

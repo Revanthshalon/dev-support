@@ -92,9 +92,23 @@ cargo build --workspace
 cargo deny check                  # must pass before any dependency change is merged
 ```
 
-Memgraph data lives in the named volumes `memgraph_data` and `memgraph_log`. They survive
-`docker compose down`; only `docker compose down -v` deletes them.
-*(Planned: data moves to a bind mount at `docker/memgraph/`, see the layer design.)*
+Memgraph data is bind-mounted at `docker/memgraph/` (`lib/` for data and the embedding-model
+cache, `log/` for logs; git-ignored). It survives `docker compose down` and restarts: Memgraph
+snapshots every 5 minutes and on exit, and recovers on startup. Delete `docker/memgraph/` to start
+from an empty graph.
+
+`docker compose --profile embeddings up -d` also runs `embeddings-warmup`, which loads
+`EMBEDDINGS_MODEL` up front and fails loudly on a bad model name or provider key. For local
+models on NVIDIA GPUs, add `-f docker-compose.yml -f docker-compose.gpu.yml`.
+
+> [!NOTE]
+> **Linux hosts:** the container runs as the `memgraph` user, so the bind-mounted directories must
+> be writable by its uid. Before the first `up`:
+> ```sh
+> uid=$(docker run --rm --entrypoint id memgraph/memgraph-mage:3.14.0 -u memgraph)
+> mkdir -p docker/memgraph/lib docker/memgraph/log && sudo chown -R "$uid:$uid" docker/memgraph
+> ```
+> Docker Desktop on macOS and Windows needs nothing.
 
 ### Using it on a workspace *(planned)*
 
