@@ -30,7 +30,7 @@ services:
   # One-shot: `docker compose --profile embeddings up -d` loads EMBEDDINGS_MODEL now (downloading
   # it if needed) and checks the provider key, instead of failing at the first `ops index`.
   embeddings-warmup:
-    image: memgraph/mgconsole:1.7.1
+    image: memgraph/memgraph-mage:3.14.0 # ships mgconsole and a shell (the mgconsole image has no shell)
     profiles: [embeddings]
     depends_on:
       - memgraph
