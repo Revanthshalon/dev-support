@@ -94,8 +94,8 @@ This document adds those seven capabilities to the operational-support mode.
    or `reraised_as X`. A re-raise continues the walk as a new raise of type X, with `status` taken
    from an `HTTPException`.
 5. **Escaping the top:**
-   - At a **route handler**: a `handles_exception` mapping for T (or an ancestor) gives its
-     status. Otherwise an `HTTPException` gives its own status, and FastAPI's default is
+   - At a **route handler**: a `handles_exception` mapping for T (or an ancestor), **registered in
+     the same service as the route**, gives its status. Each FastAPI app has its own handlers. Otherwise an `HTTPException` gives its own status, and FastAPI's default is
      `500 Internal Server Error`.
    - At a **worker entrypoint** or **queue consumer**: `job fails`, plus `retried` when the Celery
      task has `autoretry_for` covering T, or `bind=True` with `self.retry`.
@@ -160,7 +160,7 @@ compiles them and reports any that lack an `id` group.
 | `<redis>.publish(channel, …)` | send | `channel` | `pubsub` |
 | `<pubsub>.subscribe/psubscribe(channel)` | receive | `channel` | `pubsub` |
 | `@<app>.task(name="x")` / `@shared_task` on `def f` | receive | `x`, else the module path + `.f` | `celery` |
-| `f.delay(…)` / `f.apply_async(…)` / `<app>.send_task("x")` | send | resolved through `f`'s task name, or `x` | `celery` |
+| `f.delay(…)` / `f.apply_async(…)` / `<app>.send_task("x")` | send | recorded as `task_ref` (the receiver `f`, or the literal `x`), then resolved by the link step against a **workspace-wide** index of task names and task function names. Celery task names are global, so service-scoped call resolution would miss tasks in other services | `celery` |
 | `Queue("q").enqueue(f, …)` / `<q>.enqueue(…)` | send | `q` (`default` if unnamed) | `rq` |
 | an RQ worker started with `Worker([...queues])` | receive | each listed name | `rq` |
 
@@ -193,10 +193,18 @@ compiles them and reports any that lack an `id` group.
     table.
   - `session.add(M(...))`, `session.delete(…)`, `session.merge(…)`, `update(M)`, `insert(M)` and
     `delete(M)` write it. Here `via` is `orm`.
+  - The parser records only the **model name** (`DbOp.model`). The link step resolves the model to
+    its class's `table` using the usual order (same file, same service, used libraries), because
+    models usually live in a shared library.
 
 ### 4.2 Graph
 - `(:Table {id: "table:{datastore}:{schema.}name", name, schema, layer: "structural"})`.
-  `datastore` is the service's single Postgres datastore, else `_`.
+  - `datastore` is the Postgres datastore of the **service doing the access** (its single one,
+    else `_`).
+  - A model defined in a library takes the datastore of each service that references it, and its
+    `MAPS_TO` points at each of those table nodes. `_` is used only when no service references it.
+  - This keeps one table one node across services and shared libraries, so `BOUNDARY via table`
+    sees shared-database coupling.
 - `(:Function)-[:READS_TABLE {via, lines}]->(:Table)`, `(:Function)-[:WRITES_TABLE {via, lines}]->(:Table)`
 - `(:Class)-[:MAPS_TO]->(:Table)`
 - Table nodes are link-step nodes (§7).
