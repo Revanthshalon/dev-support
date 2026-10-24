@@ -371,7 +371,7 @@ environment (verified in `src/mage/python/embeddings.py` at v3.14.0).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `EMBEDDINGS_MODEL` | `all-MiniLM-L6-v2` | The model the warmup service loads and checks (below). Keep it equal to `semantic.embeddings.model` in `ops.yaml`; `ops check` flags a mismatch. |
+| `EMBEDDINGS_MODEL` | `all-MiniLM-L6-v2` | The model the warmup service loads and checks (below). Keep it equal to `semantic.embeddings.model` in `ops.yaml`. `ops check` can't read the container's environment, so it prints the model `ops.yaml` resolves to for you to compare; a mismatch only means the first index downloads that model. |
 | `HF_HOME` | `/var/lib/memgraph/hf-cache` (set in compose) | Model cache, on the bind mount (`docker/memgraph/lib/hf-cache`), so models download once |
 | `HF_TOKEN` | unset | Hugging Face token for gated or private local models |
 | `HF_HUB_OFFLINE` | `0` | `1` = never download; models must already be in the cache (air-gapped) |
