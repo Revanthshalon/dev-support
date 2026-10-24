@@ -1,0 +1,31 @@
+# Local Memgraph for ops-support. Credentials come from .env (see .env.example).
+# Data lives in named volumes and survives `docker compose down`; only `down -v` deletes it.
+services:
+  memgraph:
+    image: memgraph/memgraph-mage:latest
+    container_name: memgraph-mage
+    ports:
+      - "7687:7687" # Bolt
+      - "7444:7444" # log streaming
+    command: ["--log-level=WARNING", "--also-log-to-stderr", "--storage-properties-on-edges=true"]
+    volumes:
+      - memgraph_data:/var/lib/memgraph
+      - memgraph_log:/var/log/memgraph
+    environment:
+      - MEMGRAPH_USER=${MEMGRAPH_USER:-ops}
+      - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD:-ops}
+
+  lab:
+    image: memgraph/lab:latest
+    container_name: memgraph-lab
+    ports:
+      - "3000:3000"
+    depends_on:
+      - memgraph
+    environment:
+      - QUICK_CONNECT_MG_HOST=memgraph
+      - QUICK_CONNECT_MG_PORT=7687
+
+volumes:
+  memgraph_data:
+  memgraph_log:

@@ -1,0 +1,54 @@
+# cargo-deny configuration. Run: `cargo deny check`
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Vulnerabilities always fail. Also fail on unmaintained crates anywhere in the tree,
+# yanked versions and unsound crates. Add a reviewed exception to `ignore` (with a reason) when needed.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses only. Widening this list is a reviewed change, never a drive-by.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "CC0-1.0",   # const-random-macro (via config)
+    "BSL-1.0",   # Boost Software License (via redis)
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[licenses.private]
+# Our own crates are `publish = false` and unlicensed.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+allow-wildcard-paths = true
+deny = [
+    # Plan decision: Memgraph is accessed through rsmgclient only.
+    { crate = "neo4rs", reason = "use rsmgclient" },
+    # Datastores in scope are Postgres and Redis.
+    { crate = "sqlx-mysql", reason = "out of scope: postgres and redis only" },
+    { crate = "sqlx-sqlite", reason = "out of scope: postgres and redis only" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

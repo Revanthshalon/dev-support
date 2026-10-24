@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["services/engine", "services/cli", "services/mcp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+engine = { path = "services/engine" }
+
+# CLI / MCP
+clap = { version = "4.6.7", features = ["derive"] }
+rmcp = { version = "3.7.0", features = ["server", "transport-io", "macros"] }
+
+# Runtime, errors, serialization
+anyhow = "1.0.104"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process", "time", "io-util", "io-std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_norway = "0.9.42"
+config = { version = "0.15.27", features = ["yaml"] }
+
+# Text and filesystem
+regex = "1.13.1"
+shlex = "2.0.1"
+walkdir = "2.5.0"
+
+# Parsing
+tree-sitter = "0.27.1"
+tree-sitter-python = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-html = "0.23.2"
+tree-sitter-css = "0.25.0"
+
+# Graph store and datastores
+rsmgclient = "4.0.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "json"] }
+redis = { version = "1.8.0", features = ["tokio-comp"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
