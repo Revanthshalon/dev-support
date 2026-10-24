@@ -157,6 +157,79 @@ logging:                                            # optional; these are the de
 Override any value without editing the file using `OPS_`-prefixed env vars, with `__` between
 nesting levels, for example `OPS_MEMGRAPH__PORT=7688`.
 
+## Embeddings and semantic search *(planned)*
+
+> [!NOTE]
+> Designed in [`2026-10-24-persistence-and-semantic-layer-design.md`](docs/superpowers/specs/2026-10-24-persistence-and-semantic-layer-design.md) §4.5.
+> Uses Memgraph's native vector indexes, text indexes and the MAGE `embeddings` module, all in the
+> free Community edition. ops-support adds no ML dependency of its own.
+
+The model name picks the path:
+- **A bare name or Hugging Face path** (the default, `all-MiniLM-L6-v2`) runs locally inside
+  Memgraph. No key is needed.
+- **`provider/model`** (`openai/text-embedding-3-small`, `voyage/voyage-3`,
+  `ollama/nomic-embed-text`, …) is called remotely through LiteLLM.
+
+Memgraph reads provider API keys from **its own container environment**, never from `ops.yaml`.
+That's why keys are set in `.env` before `docker compose up`.
+
+### 1. When starting Docker: `.env` in this repo
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `EMBEDDINGS_MODEL` | `all-MiniLM-L6-v2` | Model the warmup service loads; keep it equal to `semantic.embeddings.model` |
+| `HF_TOKEN` | unset | Gated or private Hugging Face models |
+| `HF_HUB_OFFLINE` | `0` | `1` = never download (air-gapped; pre-seed `docker/memgraph/lib/hf-cache`) |
+| `OPENAI_API_KEY` | unset | `openai/…` |
+| `AZURE_API_KEY`, `AZURE_API_BASE`, `AZURE_API_VERSION` | unset | `azure/<deployment>` |
+| `COHERE_API_KEY` | unset | `cohere/…` |
+| `VOYAGE_API_KEY` | unset | `voyage/…` |
+| `MISTRAL_API_KEY` | unset | `mistral/…` |
+| `GEMINI_API_KEY` | unset | `gemini/…` |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION_NAME` | unset | `bedrock/…` |
+
+Ollama needs no key; point `api_base` at it in `ops.yaml`. Any other LiteLLM provider variable
+works too, because the whole `.env` is passed to the Memgraph container.
+
+```sh
+docker compose up -d                                   # defaults: local model on CPU, downloaded on first use
+docker compose --profile embeddings up -d              # also download/load EMBEDDINGS_MODEL and check its key now
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d   # NVIDIA GPU for local models (Linux)
+```
+
+### 2. Per workspace: `ops.yaml`
+
+Every field accepts a literal or `{ env: NAME }`, and can be overridden with
+`OPS_SEMANTIC__EMBEDDINGS__<FIELD>`.
+
+```yaml
+semantic:
+  embeddings:
+    enabled: true              # false = text search only
+    model: all-MiniLM-L6-v2    # bare/HF name → local; provider/model → remote (LiteLLM)
+    # local only
+    device: null               # null (first GPU, else CPU) | cpu | cuda | all | "cuda:1" | 1 | [0, 1]
+    batch_size: 2000
+    chunk_size: 48             # per-GPU chunk, multi-GPU path
+    # remote only
+    api_base: null             # Ollama, Azure, proxies
+    input_type: document       # how code cards and knowledge are embedded
+    query_input_type: query    # how search queries are embedded (Cohere/Voyage use it)
+    dimensions: null           # truncate output, if the provider supports it
+    timeout: 60
+    num_retries: 3
+    normalize: true
+    remote_batch_size: null    # null = 96 for Cohere, 256 otherwise
+    concurrency: 4             # 1–32 parallel requests
+    # vector index
+    metric: cos
+    scalar_kind: f32
+```
+
+Changing `model`, `dimensions`, `metric` or `scalar_kind` rebuilds the vector indexes and
+re-embeds everything on the next `ops index`. `ops check` reports which path is active (local, or
+remote with the provider), the vector dimension, and any load or key error.
+
 ## Modes
 
 `ops-mcp --mode <mode>` picks one bundle of tools, prompts and instructions per server process.

@@ -279,18 +279,85 @@ Memgraph's docs and repo at v3.14.0.
 4. Boost hits within 2 hops of `target` / `service`.
 5. Drop `retracted` hits, and flag `stale` ones.
 
-**Configuration** (new `semantic:` section in `ops.yaml`):
+**Configuration.** It's split by *who reads it*, because the Memgraph `embeddings` module never
+takes API keys as arguments. LiteLLM, inside the Memgraph process, reads them from that process's
+environment (verified in `src/mage/python/embeddings.py` at v3.14.0).
+
+**(a) At `docker compose up`: the Memgraph container** (repo `.env`, loaded with
+`env_file: {path: .env, required: false}` on the memgraph service)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `EMBEDDINGS_MODEL` | `all-MiniLM-L6-v2` | The model the warmup service loads and checks (below). Keep it equal to `semantic.embeddings.model` in `ops.yaml`; `ops check` flags a mismatch. |
+| `HF_HOME` | `/var/lib/memgraph/hf-cache` (set in compose) | Model cache, on the bind mount (`docker/memgraph/lib/hf-cache`), so models download once |
+| `HF_TOKEN` | unset | Hugging Face token for gated or private local models |
+| `HF_HUB_OFFLINE` | `0` | `1` = never download; models must already be in the cache (air-gapped) |
+| `OPENAI_API_KEY` | unset | `openai/…` models |
+| `AZURE_API_KEY`, `AZURE_API_BASE`, `AZURE_API_VERSION` | unset | `azure/<deployment>` models |
+| `COHERE_API_KEY` | unset | `cohere/…` models |
+| `VOYAGE_API_KEY` | unset | `voyage/…` models |
+| `MISTRAL_API_KEY` | unset | `mistral/…` models |
+| `GEMINI_API_KEY` | unset | `gemini/…` models |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION_NAME` | unset | `bedrock/…` models |
+| *(none)* | | `ollama/…` models need no key; set `api_base` in `ops.yaml` (e.g. `http://host.docker.internal:11434`) |
+
+Any other LiteLLM provider variable works the same way, because the whole `.env` is passed
+through. Only what you set is present; an unset key matters only if a model for that provider is
+chosen.
+
+**Ways to start it:**
+```sh
+docker compose up -d                                          # defaults: local all-MiniLM-L6-v2, CPU, downloads on first use
+docker compose --profile embeddings up -d                     # also runs `embeddings-warmup`: downloads/loads EMBEDDINGS_MODEL
+                                                              # and checks the provider key now, not at first index
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d   # local models on NVIDIA GPUs
+```
+- **`embeddings-warmup`** (profile `embeddings`): a one-shot service that waits for Memgraph, then
+  runs `CALL embeddings.model_info({model_name: $EMBEDDINGS_MODEL}) YIELD info RETURN info;` and
+  exits non-zero (with the redacted error) if the model can't load or the key is rejected.
+  *Builder: confirm `mgconsole` is in the `memgraph-mage` image; if not, use the `memgraph/mgconsole`
+  image for this service.*
+- **`docker-compose.gpu.yml`** adds `deploy.resources.reservations.devices: [{driver: nvidia,
+  count: all, capabilities: [gpu]}]` to the memgraph service. It needs the NVIDIA Container
+  Toolkit on the host. Docker Desktop on macOS has no GPU passthrough, so local models run on CPU
+  there.
+
+**(b) Per call: `ops.yaml` `semantic.embeddings`** (ops-support passes these as the configuration
+map to `embeddings.text` / `embeddings.model_info`). Every field accepts a literal or
+`{ env: NAME }`, and can be overridden with `OPS_SEMANTIC__EMBEDDINGS__<FIELD>`.
+
 ```yaml
 semantic:
   embeddings:
-    backend: local                 # local | remote
-    model: all-MiniLM-L6-v2        # local: any SentenceTransformer name; remote: a LiteLLM model id
-    api_base: null                 # remote only
+    enabled: true                  # false = text search only, nothing gets embedded
+    model: all-MiniLM-L6-v2        # bare name / HF path → local SentenceTransformer inside Memgraph;
+                                   # "provider/model" (openai/text-embedding-3-small, voyage/voyage-3,
+                                   # cohere/embed-english-v3.0, ollama/nomic-embed-text, …) → remote via LiteLLM
+    # local only
+    device: null                   # null (first GPU, else CPU) | cpu | cuda | all | "cuda:1" | 1 | [0, 1]
+    batch_size: 2000
+    chunk_size: 48                 # per-GPU chunk on the multi-GPU path
+    # remote only
+    api_base: null                 # override the provider endpoint (Ollama, Azure, proxies)
+    input_type: document           # what cards/entries are embedded as
+    query_input_type: query        # what search queries are embedded as (matters for Cohere/Voyage)
+    dimensions: null               # truncate output, if the provider supports it
+    timeout: 60                    # seconds per request
+    num_retries: 3
+    normalize: true                # L2-normalize remote vectors, like the local path
+    remote_batch_size: null        # null = 96 for Cohere, 256 otherwise
+    concurrency: 4                 # parallel requests, 1–32
+    # vector index (ops-support)
+    metric: cos                    # cos | ip | l2sq …
+    scalar_kind: f32               # f32 | f16 | bf16 … (smaller = less memory, less precision)
 ```
-- Remote-provider credentials are read **by the Memgraph process**, so they go in the compose
-  service's environment from `.env`, never in `ops.yaml`.
-- `backend` and `model` are part of the index fingerprint (§3). Changing either drops and recreates
-  the vector indexes and re-embeds every card and entry.
+- Options the module has but ops-support sets itself (`embedding_property`,
+  `excluded_properties`, `return_embeddings`) are not user-facing, because ops-support always uses
+  `embeddings.text`.
+- `model`, `dimensions`, `metric` and `scalar_kind` are part of the index fingerprint (§3).
+  Changing any of them drops and recreates the vector indexes and re-embeds every card and entry.
+- `ops check` calls `embeddings.model_info` with this config and reports which path is in use
+  (local, or remote with the provider name), the dimension, and any load or auth error.
 
 **Operational notes (from Memgraph's docs)**
 - Deleting nodes doesn't free vector-index memory until the index is dropped. `ops index --full`
@@ -300,9 +367,9 @@ semantic:
   goes through `vector_search.*` in ops-support's own Cypher, so `graph_query` still rejects `CALL`.
 - Snapshots and the WAL store vector values. The docs don't say whether index *definitions* are
   restored on restart; the idempotent creation before each run covers that either way.
-- The local backend downloads the model from Hugging Face on first use. Set `HF_HOME` in the
-  memgraph service to a path on the bind mount (`/var/lib/memgraph/hf-cache`), so it downloads
-  once. Air-gapped setups pre-seed that directory or use `backend: remote`.
+- The local path downloads the model from Hugging Face on first use (or at `up` with the
+  `embeddings` profile). It's cached under `HF_HOME` on the bind mount. Air-gapped setups pre-seed
+  that directory and set `HF_HUB_OFFLINE=1`, or use a remote/Ollama model.
 - Set `omit_vector_index_properties_on_return`, and strip `embedding` in `store::query` too, so
   vectors never appear in tool output.
 - The export (§4.4) leaves vectors out. They're recomputed on import, which keeps git diffs
@@ -352,7 +419,7 @@ semantic:
   - `save_incident_report` / `find_incident_reports`.
   - Staleness info on graph tools, and `reindex`.
 - Part 1 extractors: capture docstrings / JSDoc. New task: code cards, embedding on index, vector and text indexes. Part 2: `search_code`, vector-backed `recall`, `ops check` embedding status.
-- `docker-compose.yml`: pin the MAGE image (≥ 3.6), set `HF_HOME` on the bind mount.
+- `docker-compose.yml`: pin the MAGE image (≥ 3.6), set `HF_HOME` on the bind mount, `env_file: .env`, and the `embeddings-warmup` service (profile `embeddings`). New `docker-compose.gpu.yml`. `.env.example` gains the variables in table (a).
 - New dependencies: a hash crate (`sha2`, already in the tree through sqlx), a file watcher
   (`notify`), and `uuid`, each passing `cargo deny`.
 
