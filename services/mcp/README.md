@@ -31,7 +31,9 @@ Register it with Claude Code:
 claude mcp add ops -- ops-mcp --root /path/to/workspace --mode operational-support
 ```
 
-or use the `.mcp.json` that `ops init` writes.
+or use the `.mcp.json` that `ops init` writes. GitHub Copilot CLI connects to the same stdio
+server; `ops init` writes or prints its MCP config snippet. Both clients share one graph and one
+semantic layer, and each knowledge entry records which client and model wrote it.
 
 The workspace must be indexed first (`ops index`). The server still starts without Memgraph or
 any datastore; affected tools report the failure as text.
@@ -66,17 +68,25 @@ One mode per process. To use several, register the server several times.
 | Data | `db_query` / `db_schema` | Read-only PostgreSQL |
 | | `redis_command` | Allow-listed read-only Redis commands |
 | | `datastore_health` | Connections, long queries and locks (Postgres); memory, evictions and clients (Redis) |
+| Semantic layer | `recall` | Knowledge about a node and its neighbours, or search by meaning (vector + text) |
+| | `search_code` | Find code by meaning ("where do we take payment") |
+| | `knowledge_gaps` | Important code with no summary yet, plus stale and orphaned entries |
+| | `remember` / `revise` / `retract` | Record, update (keeping history) or withdraw an entry: summary, concept, flow, relation, invariant, gotcha, ops note, always with evidence and confidence |
+| Index | `reindex` | Incremental re-index on request; reports "index in progress" if another indexer runs |
+| Incidents | `find_incident_reports` | Search past reports by service, category or text; the first reference in `diagnose` |
+| | `save_incident_report` | Save a finished report to `incidents.dir` (default `docs/incidents/`), never overwriting |
 
 ## Prompts (agents)
 
 | Prompt | Use it to |
 |---|---|
-| `diagnose(problem)` | Run the full investigation and classify the root cause: operational procedure, misconfiguration, datastore, code bug or infrastructure |
+| `diagnose(problem)` | Run the full investigation, starting from past incident reports and recalled knowledge. Classify the root cause (operational procedure, misconfiguration, datastore, code bug or infrastructure), and record durable facts learned along the way |
 | `triage_logs(service)` | Summarize what's going wrong in one service's logs |
 | `explain_flow(entry)` | Walk a route, function or UI event through the code |
 | `check_misconfiguration(service)` | Hunt for config and environment problems |
 | `investigate_datastore(datastore, symptom)` | Dig into a Postgres or Redis symptom |
-| `write_rca(findings)` | Produce an incident report from [`templates/incident-report.md`](templates/incident-report.md) |
+| `write_rca(findings)` | Produce an incident report from [`templates/incident-report.md`](templates/incident-report.md), then save it with `save_incident_report` |
+| `enrich_knowledge(scope)` | Work through `knowledge_gaps`: read the code, then `remember` summaries, flows, relations and gotchas, or `revise` stale entries |
 
 The incident report covers symptoms and how to recognize them, root cause with a causal chain and
 evidence, a checklist to validate a recurrence, mitigation and a permanent fix, a checklist to
@@ -91,6 +101,8 @@ validate the resolution, prevention, and a five-minute runbook entry.
   always denied.
 - Kubernetes access is limited to `kubernetes.namespaces`. Arguments are never passed through a
   shell.
+- Writes to Memgraph happen only through `remember` / `revise` / `retract` (schema-checked, size-capped,
+  redacted) and `reindex`. `graph_query` stays read-only, and knowledge is never hard-deleted.
 - stdout carries only MCP protocol messages. Diagnostics go to stderr and `.ops/logs/`.
 - **Every tool call is audited** to `.ops/logs/audit.YYYY-MM-DD.jsonl`: tool, redacted arguments,
   outcome, duration, backends touched and result size. Result content is never recorded.

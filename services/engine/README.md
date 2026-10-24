@@ -9,12 +9,19 @@ binaries are thin layers over this crate.
 > **Status: stub.** The crate declares its dependencies but has no modules yet. They are added by
 > [Part 1](../../docs/superpowers/plans/2026-10-24-ops-indexer.md) (indexer) and
 > [Part 2](../../docs/superpowers/plans/2026-10-24-ops-mcp.md) (MCP tooling) of the plan. The
-> design is in the [spec](../../docs/superpowers/specs/2026-10-24-ops-support-design.md).
+> design is in the [spec](../../docs/superpowers/specs/2026-10-24-ops-support-design.md) and the
+> [persistence and semantic-layer design](../../docs/superpowers/specs/2026-10-24-persistence-and-semantic-layer-design.md).
 
 ## Design rules
 
-- **Pure core, thin I/O edges.** `graph::build` turns a workspace into nodes and edges with no
-  database involved, so it's tested against fixtures alone. Only `store` talks to Memgraph.
+- **Pure core, thin I/O edges.** Graph building is pure, so it's tested against fixtures alone:
+  `graph::file_graph` handles one file, `graph::workspace_graph` handles docker, config and
+  contracts, and `graph::link` computes cross-file edges from node properties. Only `store` (and
+  the semantic and embedding modules built on it) talks to Memgraph.
+- **Two layers, one graph.** The *structural* layer (`layer: "structural"`) is rebuilt from code,
+  incrementally, with stable line-free ids. The *semantic* layer (`:Knowledge`) is written by MCP
+  clients and is never deleted by indexing. Changed code marks its entries `stale`; removed code
+  marks them `orphaned`.
 - **Config is the source of truth.** Every module takes a loaded `Ctx` (the `ops.yaml` config,
   the workspace root and `.env` values) rather than reading the environment itself.
 - **Secrets stay secret.** A credential is a literal or `{ env: NAME }`, never shows up in
@@ -34,14 +41,19 @@ binaries are thin layers over this crate.
 | `parse` | tree-sitter extraction: Python (FastAPI, workers), TypeScript/Angular, HTML templates, CSS | P1·4–5 |
 | `contract` | OpenAPI 3.x endpoints and schemas | P1·5b |
 | `graph` | Builds the service graph: code, docker, contracts, `BOUNDARY` summaries | P1·6 |
-| `store` | Memgraph through `rsmgclient`: idempotent write, query, ping | P1·7 |
+| `store`, `lock` | Memgraph through `rsmgclient`: incremental index (upsert, relink, one transaction), query, ping; single-writer `.ops/index.lock` | P1·7 |
+| `watch` | `ops watch`: debounced file watcher → incremental index | P1·7b |
+| `embed` | Code cards and knowledge embedded by Memgraph's MAGE `embeddings` module; vector and text indexes; text-only fallback | P1·7c |
+| `semantic` | The knowledge layer: create, revise, retract, recall by anchor; drift reconciliation; `ops knowledge export/import` | P1·7d |
 | `telemetry` | `tracing` setup: stderr plus rotated files, redacting writer | P2·8a |
-| `codeq` | Graph and code queries; read-only Cypher guard; `read_file` path allow-list | P2·8 |
+| `codeq` | Graph and code queries; read-only Cypher guard; `read_file` path allow-list; index staleness | P2·8 |
+| `search` | Hybrid search: vector + full text, rank-fused, graph-boosted | P2·8b |
 | `logs`, `runtime` | Log sources (compose, kubectl, file, command); compose and k8s status | P2·9 |
 | `logmatch` | Log line or traceback → `LogStatement` → function; clustering | P2·10 |
 | `cfgcheck` | Missing env vars, port mismatches, unreachable hosts, with `file:line` | P2·11 |
 | `datastore` | Read-only PostgreSQL and allow-listed Redis | P2·12 |
 | `lsp` | Minimal LSP client: definition, references, hover, document symbols | P2·13 |
+| `incidents` | Save incident reports as files (never overwriting) and search past ones | P2·13b |
 
 ## Graph model at a glance
 
@@ -52,6 +64,9 @@ binaries are thin layers over this crate.
 (:Route)-[:HANDLED_BY]->(:Function)        (:Function)-[:CALLS_API]->(:Route)
 (:Service)-[:PROVIDES | CONSUMES]->(:Contract)-[:DECLARES]->(:Endpoint)-[:IMPLEMENTED_BY]->(:Route)
 (:Function)-[:READS_ENV]->(:EnvVar)<-[:SETS_ENV]-(:Service)
+
+(:Knowledge {kind, status: current|stale|orphaned|retracted})-[:ABOUT | STEP | FROM | TO]->(any structural node)
+(:IndexRun)                                 one per index run (parse and embed fingerprints)
 ```
 
 The spec has the full model, including properties and node ids.
@@ -65,6 +80,10 @@ The spec has the full model, including properties and node ids.
 | Graph store | `rsmgclient`: builds the C `mgclient` and needs cmake and OpenSSL 3 (see the [root README](../../README.md#prerequisites)) |
 | Datastores | `sqlx` (postgres only), `redis` |
 | Runtime and utilities | `tokio`, `anyhow`, `regex`, `shlex`, `walkdir` |
+| Planned additions | `sha2` (file and body hashes), `notify` (`ops watch`), `uuid` (knowledge ids), `tracing` stack (logging) |
+
+Embeddings, vector search and text search come from Memgraph itself (MAGE image, Community
+edition), so the crate has no ML dependency.
 
 Versions are pinned in the root `Cargo.toml`, and every addition must pass `cargo deny check`.
 
