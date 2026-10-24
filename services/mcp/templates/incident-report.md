@@ -45,7 +45,7 @@ Rules for whoever fills this in (agent or human):
 
 | Time | Event | Source |
 |---|---|---|
-| {{t}} | {{trigger, e.g. deploy, config change, traffic spike}} | {{commit / deploy id / k8s event}} |
+| {{t}} | {{trigger, e.g. deploy, config change, traffic spike}} | {{commit / deploy id / k8s event: `recent_changes(...)`, `k8s_status` rollouts}} |
 | {{t}} | {{first error observed}} | `analyze_logs(services=[…], since=…)` |
 | {{t}} | {{detection}} | {{alert / report}} |
 | {{t}} | {{mitigation applied}} | {{who / what}} |
@@ -93,7 +93,7 @@ Rules for whoever fills this in (agent or human):
 
 ### 5.3 Causal chain
 
-<!-- Trigger → fault → failure → symptom. Name the code path with trace_flow, including the boundary (http / contract / compose / shared_lib) where the failure crossed services. -->
+<!-- Trigger → fault → failure → symptom. Name the code path with trace_flow, including the boundary (http / contract / compose / shared_lib / queue / table) where the failure crossed services. Use error_paths to show how the error travelled to the status the user saw, and request_timeline when a request id is known. -->
 
 1. **Trigger:** {{what changed or happened}}
 2. **Fault:** {{the defect / misconfiguration}} at `{{file:line}}` or `{{config key, file:line}}`
@@ -203,7 +203,7 @@ Rules for whoever fills this in (agent or human):
 
 ### C. Affected flow
 
-<!-- The `trace_flow` output for the failing path, trimmed to the relevant hops. -->
+<!-- The `trace_flow` and `error_paths` output for the failing path, plus the `request_timeline` for one affected request if available, trimmed to the relevant hops. -->
 ```
 {{flow}}
 ```

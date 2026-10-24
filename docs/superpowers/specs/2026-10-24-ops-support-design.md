@@ -45,6 +45,19 @@ the code flow, inspect configuration and datastores, determine the root cause an
   - Search by meaning uses Memgraph's native embeddings, vector and text indexes (Community edition).
   - Incident reports are saved as files and searched as the first reference. There's no incident
     memory in the graph.
+- **Execution-flow analysis and investigation tools** are specified in
+  [`2026-10-24-execution-flow-and-investigation-tools-design.md`](2026-10-24-execution-flow-and-investigation-tools-design.md)
+  ("the flow design"):
+  - static error paths (raise → handler → HTTP status or job outcome);
+  - cross-service request timelines from logs, by correlation id;
+  - async queue hops (Redis lists, streams, pub/sub, Celery, RQ);
+  - table access from SQL literals and SQLAlchemy;
+  - recent git changes mapped to functions;
+  - blast radius via `service_map` focus;
+  - rollout history in `k8s_status`/`compose_status`.
+
+  This widens static analysis scope: Python gets exceptions, queues and tables, TypeScript gets
+  `throw`/`catch` only. It also adds the optional `git` CLI as a runtime dependency.
 
 ## Repository layout
 ```
@@ -106,8 +119,16 @@ semantic:                                           # optional; full option list
   embeddings:
     enabled: true
     model: { env: EMBEDDINGS_MODEL, default: all-MiniLM-L6-v2 }   # "provider/model" = remote via LiteLLM
+    chunking: { enabled: true, max_tokens: auto, overlap_tokens: 32 }  # long symbols embedded in overlapping chunks
 incidents:
   dir: docs/incidents                               # where write_rca reports are saved
+correlation:                                        # optional; request-id patterns for request_timeline (flow design §2.1)
+  clock_skew_ms: 500
+changes:
+  since: 7d                                         # default look-back for recent_changes
+indexing:                                           # optional; layer design §3.1
+  max_file_bytes: 1MiB                              # 0 = no limit; also --max-file-bytes / OPS_INDEXING__MAX_FILE_BYTES
+  overrides: [{ path: "services/legacy/**", max_file_bytes: 8MiB }]
 ```
 `ops init` also writes `.env.example` (every `env:` name referenced) and `.mcp.json`.
 
@@ -115,12 +136,19 @@ incidents:
 Every node carries `id` and `workspace`. Structural nodes (everything below) also carry
 `layer: "structural"`.
 - **Ids have no line numbers**, e.g. `sym:{service}:{path}:{qualname}`, so they're stable across edits.
-- Symbols carry `body_hash`, `card` (code-card text) and `embedding`.
+- Symbols carry `body_hash` and `card` (the code-card header). Their embeddings live on
+  `(:Chunk)-[:CHUNK_OF]->(symbol)` nodes (header plus a slice of the body), so long functions
+  stay searchable end to end.
 - Files carry their content `hash`.
 - `(:IndexRun)` records each run.
 
 The semantic layer (`:Knowledge` with `ABOUT`/`STEP`/`FROM`/`TO`/`SUPERSEDES`) is defined in the
-layer design §4.
+layer design §4. The flow design adds:
+- `(:Queue)` with `SENDS_TO`/`RECEIVES_FROM`/`ON`;
+- `(:Table)` with `READS_TABLE`/`WRITES_TABLE`/`MAPS_TO`;
+- `lines` on `CALLS`;
+- `queue` and `table` values for `BOUNDARY.via`;
+- exception facts on symbols.
 ```
 (:Service {name, kind: service|library|infra, language, framework, image})
 (:Service)-[:DEPENDS_ON]->(:Service)              compose depends_on
@@ -199,7 +227,7 @@ This section is the `operational-support` mode, the MVP.
 
 **Tools.** Graph and code: `service_map` (boundaries with evidence), `contract`, `find_symbol`, `code_context`, `trace_flow`, `read_file`,
 `graph_query`, `lsp`. Operations: `fetch_logs`, `match_log`, `analyze_logs`, `compose_status`,
-`k8s_status`, `service_config`, `check_config`, `reindex`. Data: `db_query`, `db_schema`, `redis_command`,
+`k8s_status`, `service_config`, `check_config`, `reindex`, `error_paths`, `request_timeline`, `recent_changes`. Data: `db_query`, `db_schema`, `redis_command`,
 `datastore_health`. Semantic layer: `remember`, `revise`, `retract`, `recall`, `knowledge_gaps`,
 `search_code`. Incidents: `save_incident_report`, `find_incident_reports`.
 **Prompts (agents).** `diagnose`, `triage_logs`, `explain_flow`, `check_misconfiguration`,
@@ -254,6 +282,7 @@ through `redact` before it reaches any sink.
 - `read_file` / `lsp` paths must fall under configured service, library and contract paths or be
   compose files or Dockerfiles. `.env*`, `.ops/` and `ops.yaml` are always denied.
 - Kubernetes calls are limited to namespaces in `kubernetes.namespaces`.
-- LLM-supplied arguments are never passed through a shell.
+- LLM-supplied arguments are never passed through a shell. `git`, `docker` and `kubectl` run with
+  read-only subcommands only; `recent_changes` returns line ranges and names, never diff text.
 - The MCP server starts with every backend down; each tool connects when called and reports
   failures as text.
