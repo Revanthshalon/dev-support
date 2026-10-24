@@ -1,6 +1,6 @@
 # Persistence, incremental indexing and the semantic layer — Design
 
-Date: 2026-10-24 · Status: draft for review · Extends: `2026-10-24-ops-support-design.md`
+Date: 2026-10-24 · Status: accepted · Extends: `2026-10-24-ops-support-design.md`
 
 ## Intent
 The graph in Memgraph is worth more than what a parser can produce. The code index takes time to

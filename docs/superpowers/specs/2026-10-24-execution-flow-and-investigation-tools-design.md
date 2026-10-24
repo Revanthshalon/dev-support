@@ -1,6 +1,6 @@
 # Execution-flow analysis and investigation tools — Design
 
-Date: 2026-10-24 · Status: draft for review · Extends: `2026-10-24-ops-support-design.md` (base spec)
+Date: 2026-10-24 · Status: accepted · Extends: `2026-10-24-ops-support-design.md` (base spec)
 and `2026-10-24-persistence-and-semantic-layer-design.md` (layer design)
 
 ## Intent
