@@ -3,24 +3,35 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
+/// Keys whose value is secret: the key ends in one of these words (so `tokens_est` and `max_tokens`
+/// stay readable).
+const KEY: &str = r"\b([A-Za-z0-9_.-]*?(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|access[_-]?key(?:[_-]?id)?|secret[_-]?key|dsn|credentials?)";
+
 /// `(pattern, replacement)`, applied in order. URL userinfo goes first so a DSN's password is masked
-/// even when its key isn't secret-looking.
+/// even when its key isn't secret-looking. Quoted values keep their quotes, so JSON stays JSON.
 static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    let sep = r#"["']?\s*[:=]\s*"#;
     [
-        // scheme://user:PASS@host
-        (r"(?i)\b([a-z][a-z0-9+.-]*://[^:/@\s]*:)[^@\s/]+@", "${1}***@"),
-        // Authorization: Bearer <token>
-        (r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+", "${1}***"),
-        // provider tokens that show up without a key: OpenAI sk-…, Hugging Face hf_…
-        (r"\b(sk-|hf_)[A-Za-z0-9_-]{6,}", "${1}***"),
-        // KEY=value / "key": "value" where the key ends in a secret-looking word
+        // scheme://user:PASS@host; greedy up to the last `@`, since raw `@` in passwords happens
         (
-            r#"(?i)\b([A-Za-z0-9_.-]*?(?:password|passwd|secret|token|api[_-]?key|private[_-]?key|dsn|credential)s?["']?\s*[:=]\s*["']?)[^"'\s,;&}]+"#,
+            r"(?i)\b([a-z][a-z0-9+.-]*://[^:/@\s]*:)[^\s/]+@".to_string(),
+            "${1}***@",
+        ),
+        // Authorization: Bearer <token> / Basic <base64>
+        (
+            r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+".to_string(),
             "${1}***",
         ),
+        (r"(?i)\b(basic\s+)[A-Za-z0-9+/=]{6,}".to_string(), "${1}***"),
+        // provider tokens that show up without a key: OpenAI sk-…, Hugging Face hf_…
+        (r"\b(sk-|hf_)[A-Za-z0-9_-]{6,}".to_string(), "${1}***"),
+        // KEY: "value", KEY='value', KEY=value
+        (format!(r#"(?i){KEY}{sep}")[^"]*""#), "${1}***\""),
+        (format!(r#"(?i){KEY}{sep}')[^']*'"#), "${1}***'"),
+        (format!(r#"(?i){KEY}{sep})[^"'\s,;&}}]+"#), "${1}***"),
     ]
     .into_iter()
-    .map(|(re, rep)| (Regex::new(re).expect("redact pattern"), rep))
+    .map(|(re, rep)| (Regex::new(&re).expect("redact pattern"), rep))
     .collect()
 });
 
@@ -68,6 +79,38 @@ mod tests {
         ] {
             let out = redact(input);
             assert!(!out.contains(secret), "{input} -> {out}");
+        }
+    }
+
+    #[test]
+    fn redacts_review_findings() {
+        for (input, secret) in [
+            ("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI", "wJalrXUtnFEMI"),
+            ("SECRET_KEY=django123", "django123"),
+            ("secret_access_key: aks12345", "aks12345"),
+            ("AWS_ACCESS_KEY_ID=AKIAEXAMPLE", "AKIAEXAMPLE"),
+            ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("password = \"hunter 2\"", "2"),
+            ("MEMGRAPH_PASSWORD: \"a,b\"", ",b"),
+            ("postgres://u:p@ss@host/db", "ss"),
+        ] {
+            let out = redact(input);
+            assert!(!out.contains(secret), "{input} -> {out}");
+        }
+        assert_eq!(
+            redact("postgres://u:p@ss@host/db"),
+            "postgres://u:***@host/db"
+        );
+    }
+
+    #[test]
+    fn keeps_token_counts() {
+        for s in [
+            "max_tokens: 256",
+            "overlap_tokens=32 max_chunks_per_symbol: 32",
+            "remote_max_tokens: 512",
+        ] {
+            assert_eq!(redact(s), s);
         }
     }
 

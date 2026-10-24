@@ -438,12 +438,31 @@ pub struct SemanticCfg {
 }
 
 /// Where a local model runs: `cpu`, `cuda`, `all`, `"cuda:1"`, a GPU index, or a list of them.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Device {
     Index(u32),
     List(Vec<u32>),
     Name(String),
+}
+
+impl<'de> Deserialize<'de> for Device {
+    // Hand-written: an untagged derive would take every string as `Name`, so an env override of
+    // `1` or `[0, 1]` would never become `Index` / `List`.
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match Value::deserialize(d)? {
+            Value::String(s) => s.parse().map_err(D::Error::custom),
+            Value::Number(n) => n
+                .as_u64()
+                .and_then(|i| u32::try_from(i).ok())
+                .map(Device::Index)
+                .ok_or_else(|| D::Error::custom(format!("invalid device {n}"))),
+            v @ Value::Array(_) => serde_json::from_value(v)
+                .map(Device::List)
+                .map_err(D::Error::custom),
+            other => Err(D::Error::custom(format!("invalid device {other}"))),
+        }
+    }
 }
 
 impl FromStr for Device {
@@ -736,7 +755,7 @@ impl Ctx {
     /// Finds `ops.yaml` in `start` or its nearest ancestor and loads it, with `OPS_*` overrides
     /// from the process env and values from `.env`.
     pub fn load(start: &Path) -> Result<Ctx> {
-        Ctx::load_with_env(start, std::env::vars().collect())
+        Ctx::load_with_env(start, utf8_env(std::env::vars_os()))
     }
 
     /// [`Ctx::load`] with `env` standing in for the process env (tests; the process env can't be
@@ -773,12 +792,11 @@ impl Ctx {
         })
     }
 
-    /// An env value: the process env first, then `.env`.
+    /// An env value: the process env first, then `.env`. An empty value counts as unset, so a
+    /// copied `.env.example` with blank entries reports them missing instead of resolving to "".
     pub fn env(&self, name: &str) -> Option<String> {
-        self.process_env
-            .get(name)
-            .or_else(|| self.dotenv.get(name))
-            .cloned()
+        let get = |m: &HashMap<String, String>| m.get(name).filter(|v| !v.is_empty()).cloned();
+        get(&self.process_env).or_else(|| get(&self.dotenv))
     }
 
     /// Resolves a setting: its literal, else its env var, else its default.
@@ -831,11 +849,24 @@ impl Ctx {
     }
 }
 
+/// The env as UTF-8 strings; entries that aren't valid UTF-8 are dropped (`std::env::vars` panics).
+fn utf8_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> HashMap<String, String> {
+    vars.into_iter()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect()
+}
+
 fn find_root(start: &Path) -> Result<PathBuf> {
-    let start = if start.is_file() {
-        start.parent().unwrap_or(start)
+    // Canonical first: a relative start like "." has no parents to walk up through.
+    let abs = start
+        .canonicalize()
+        .with_context(|| format!("workspace path {}", start.display()))?;
+    let start = if abs.is_file() {
+        abs.parent().unwrap_or(&abs)
     } else {
-        start
+        &abs
     };
     let mut dir = start;
     loop {
@@ -854,7 +885,7 @@ fn find_root(start: &Path) -> Result<PathBuf> {
 /// `KEY=VALUE`, `export KEY=VALUE`, `#` comments and quoted values. Never touches the process env.
 fn parse_dotenv(text: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
-    for line in text.lines() {
+    for line in text.trim_start_matches('\u{feff}').lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -864,10 +895,13 @@ fn parse_dotenv(text: &str) -> HashMap<String, String> {
             continue;
         };
         let value = value.trim();
+        // A quoted value runs to its closing quote (anything after, like a comment, is dropped);
+        // an unquoted one ends at ` #`.
         let value = match value.chars().next() {
-            Some(q @ ('"' | '\'')) if value.len() >= 2 && value.ends_with(q) => {
-                &value[1..value.len() - 1]
-            }
+            Some(q @ ('"' | '\'')) => match value[1..].find(q) {
+                Some(end) => &value[1..1 + end],
+                None => &value[1..],
+            },
             _ => value.split(" #").next().unwrap_or("").trim_end(),
         };
         out.insert(key.trim().to_string(), value.to_string());
@@ -967,7 +1001,13 @@ pub fn validate(config: &Config) -> Vec<String> {
 /// Days in a `\d+[dhw]` look-back, at most 90.
 fn since_days(s: &str) -> Result<u64, String> {
     let bad = || format!("{s:?} must look like 7d, 48h or 2w, at most 90 days");
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    if !s.is_ascii() || s.len() < 2 {
+        return Err(bad());
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    if !num.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad()); // u64::from_str would also take "+7"
+    }
     let n: u64 = num.parse().map_err(|_| bad())?;
     let days = match unit {
         "d" => n,
@@ -1469,6 +1509,113 @@ mod tests {
             ..ds("redis://cache:6379/0", "")
         };
         assert_eq!(none.connection_url(&c).unwrap(), "redis://cache:6379/0");
+    }
+
+    #[test]
+    fn load_from_relative_start_walks_up() {
+        let c = ctx_tmp();
+        let sub = c.root.join("services/orders");
+        std::fs::create_dir_all(&sub).unwrap();
+        // A relative path whose ancestors aren't spelled out: "." from inside the service.
+        let rel = relative_to_cwd(&sub);
+        let found = Ctx::load_with_env(&rel.join("."), HashMap::new()).unwrap();
+        assert_eq!(
+            found.root.canonicalize().unwrap(),
+            c.root.canonicalize().unwrap()
+        );
+        assert!(found.root.is_absolute(), "{:?}", found.root);
+    }
+
+    /// `p` as a path relative to the current dir (`../../..` up to the filesystem root, then down).
+    fn relative_to_cwd(p: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let ups = cwd.components().count() - 1;
+        let mut rel = PathBuf::new();
+        for _ in 0..ups {
+            rel.push("..");
+        }
+        rel.join(p.strip_prefix("/").unwrap())
+    }
+
+    #[test]
+    fn device_env_override_is_typed() {
+        let c = ctx_with(MINIMAL, None, &[("OPS_SEMANTIC__EMBEDDINGS__DEVICE", "1")]);
+        assert_eq!(
+            c.setting(c.config.semantic.embeddings.device.as_ref().unwrap())
+                .unwrap(),
+            Device::Index(1)
+        );
+        let c = ctx_with(
+            MINIMAL,
+            None,
+            &[("OPS_SEMANTIC__EMBEDDINGS__DEVICE", "[0, 1]")],
+        );
+        assert_eq!(
+            c.setting(c.config.semantic.embeddings.device.as_ref().unwrap())
+                .unwrap(),
+            Device::List(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn since_rejects_odd_input_without_panicking() {
+        for bad in ["7é", "+7d", "", "d"] {
+            assert!(since_days(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn empty_env_value_counts_as_unset() {
+        let c = ctx_with(
+            &format!(
+                "{MINIMAL}semantic: {{ embeddings: {{ model: {{ env: EMB, default: m1 }} }} }}\n"
+            ),
+            Some("EMB=\nDB_URL=\n"),
+            &[("PROC_EMPTY", "")],
+        );
+        assert_eq!(
+            c.setting(&c.config.semantic.embeddings.model).unwrap(),
+            "m1"
+        );
+        assert!(
+            Secret::Env {
+                env: "DB_URL".into()
+            }
+            .resolve(&c)
+            .is_err()
+        );
+        assert_eq!(c.env("PROC_EMPTY"), None);
+    }
+
+    #[test]
+    fn dotenv_quotes_comments_and_bom() {
+        let m = parse_dotenv(
+            "\u{feff}A=1\nB=\"x y\" # note\nE='q' #c\nF=plain # c\nG=\"has # hash\"\r\n",
+        );
+        assert_eq!(m.get("A").map(String::as_str), Some("1"));
+        assert_eq!(m.get("B").map(String::as_str), Some("x y"));
+        assert_eq!(m.get("E").map(String::as_str), Some("q"));
+        assert_eq!(m.get("F").map(String::as_str), Some("plain"));
+        assert_eq!(m.get("G").map(String::as_str), Some("has # hash"));
+    }
+
+    #[test]
+    fn non_utf8_env_entries_are_dropped() {
+        use std::ffi::OsString;
+        #[cfg(unix)]
+        let bad = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff, 0xfe])
+        };
+        #[cfg(not(unix))]
+        let bad = OsString::from("ok");
+        let env = utf8_env(vec![
+            (OsString::from("GOOD"), OsString::from("v")),
+            (OsString::from("BAD"), bad),
+        ]);
+        assert_eq!(env.get("GOOD").map(String::as_str), Some("v"));
+        #[cfg(unix)]
+        assert!(!env.contains_key("BAD"));
     }
 
     #[test]
