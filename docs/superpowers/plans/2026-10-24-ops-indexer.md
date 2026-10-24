@@ -23,7 +23,7 @@ So it's tested without a database. `store` is the only module that talks to Memg
 - Node ids are deterministic, unique within a workspace, and **contain no line numbers** (see Task 6), so semantic anchors survive edits.
 - Every structural delete matches `layer: "structural"`. No indexing path deletes or rewrites a `:Knowledge` node. Only the reconcile step (Task 7d) changes its `status` and `ABOUT` edges.
 - Indexing runs under the single-writer lock `.ops/index.lock` (Task 7).
-- Every file skipped on purpose (excluded dir, >1 MiB, `*.min.js`, unparseable) is counted, not fatal.
+- Every file skipped on purpose (excluded dir, over `indexing.max_file_bytes` (default 1 MiB), minified, an override `skip`, or unparseable) is reported with its reason, never fatal. Files are never chunked for parsing; only embeddings are chunked (layer design §3.1, §4.5.1).
 - Mark each deliberate shortcut with a `// ponytail:` comment naming its limit and upgrade path.
 - Tests that need Docker/Memgraph are `#[ignore]` and run with `cargo test -- --ignored`.
 - Every task that adds or changes a dependency ends with `cargo deny check` passing. If a license isn't on the allow-list, stop and ask; don't widen `deny.toml` yourself.
@@ -91,6 +91,10 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `#[serde(untagged)] enum EnvOr<T> { Literal(T), Env { env: String, default: Option<T> } }` and `ctx.setting<T: FromStr + Clone>(&EnvOr<T>) -> Result<T>`: env (process, then `.env`), else `default`, else an error naming the variable.
   - `SemanticCfg { embeddings: EmbeddingsCfg }`. Every `EmbeddingsCfg` field is an `EnvOr<_>` with the layer design's §4.5(b) defaults: `enabled` (true), `model` ("all-MiniLM-L6-v2"), `device` (null), `batch_size` (2000), `chunk_size` (48), `api_base` (null), `input_type` ("document"), `query_input_type` ("query"), `dimensions` (null), `timeout` (60), `num_retries` (3), `normalize` (true), `remote_batch_size` (null), `concurrency` (4; validate 1–32), `metric` ("cos"), `scalar_kind` ("f32"). `device` is an untagged enum: null, a string, an int, or a list.
   - `IncidentsCfg { dir: String /* "docs/incidents" */ }`
+  - `ByteSize(u64)`, parsed from `"1MiB"`, `"512KiB"`, `"8MiB"`, `"2GiB"`, `"1048576"` or `0`, where 0 means no limit. Bad units are an error naming the field.
+  - `IndexingCfg { max_file_bytes: EnvOr<ByteSize> /* 1MiB */, skip_minified: bool /* true */, overrides: Vec<Override { path: String /* glob */, max_file_bytes: Option<ByteSize>, skip: bool }> }`, plus `indexing::limit_for(cfg, relpath) -> Limit { max_bytes: Option<u64>, skip: bool }`: first matching glob wins. Add `globset` and run `cargo deny check`.
+  - `ChunkingCfg { enabled: bool /* true */, max_tokens: MaxTokens /* Auto | N */, remote_max_tokens: usize /* 512 */, overlap_tokens: usize /* 32 */, max_chunks_per_symbol: usize /* 32 */, strategy: Strategy /* syntax | lines */, aggregate: Aggregate /* max | mean_top2 */ }` as `EmbeddingsCfg.chunking` (`#[serde(default)]`). Validate `overlap_tokens < max_tokens` when `max_tokens` is a number.
+  - `Config` gains `indexing: IndexingCfg` (`#[serde(default)]`).
   - `Config` gains `semantic: SemanticCfg` and `incidents: IncidentsCfg`, both `#[serde(default)]`.
   - `Service { name, path, language, framework: Framework, uses: Vec<String>, api: Option<Api{prefix: String}>, docker: Option<ServiceDocker{compose_service: Option<String>, dockerfile: Option<String>}>, kubernetes: Option<ServiceK8s{namespace, selector, container: Option<String>}>, logs: Option<LogsCfg>, datastores: Vec<String>, lsp: Option<Vec<String>> }`
   - `enum Framework { Fastapi, Worker, Angular, None }` (serde lowercase)
@@ -120,6 +124,9 @@ The workspace setup below is already in the repo; only check it. The compose cha
 #[test] fn semantic_defaults_and_env() { /* ops.yaml without `semantic:` → model "all-MiniLM-L6-v2", concurrency 4, metric "cos";
   with `model: {env: EMBEDDINGS_MODEL, default: "all-MiniLM-L6-v2"}` and EMBEDDINGS_MODEL=openai/text-embedding-3-small in .env → resolves to the openai model;
   concurrency 40 → validate reports it; incidents.dir defaults to "docs/incidents" */ }
+#[test] fn byte_size_and_overrides() { assert_eq!("8MiB".parse::<ByteSize>().unwrap().0, 8 << 20); assert_eq!("0".parse::<ByteSize>().unwrap().0, 0); assert!("8MB?".parse::<ByteSize>().is_err());
+  /* overrides [legacy/**/*.py → 8MiB, **/generated/** → skip]: limit_for("services/legacy/a/x.py").max_bytes == Some(8<<20); limit_for("x/generated/y.ts").skip; default → Some(1<<20); max_file_bytes 0 → None */ }
+#[test] fn chunking_defaults() { /* no chunking section → enabled, MaxTokens::Auto, overlap 32, max_chunks 32, Strategy::Syntax, Aggregate::Max; overlap 300 with max_tokens 256 → validate problem */ }
 #[test] fn ops_env_override() { /* tmp ops.yaml port 7687; with OPS_MEMGRAPH__PORT=7688 set for the test → ctx.config.memgraph.port == 7688 (u16; may need config's try_parsing(true)) */ }
 #[test] fn dotenv_fallback_and_process_env_wins() { /* tmp dir with ops.yaml + .env FOO=a; assert ctx.env("FOO")==Some("a") */ }
 #[test] fn connection_url_injects_password() { /* url "redis://localhost:6379/0", password Literal("p@ss") → "redis://:p%40ss@localhost:6379/0" */ }
@@ -394,7 +401,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 ### Task 6: Graph builder (pure)
 
 **Files:**
-- Create: `services/engine/src/graph.rs`
+- Create: `services/engine/src/graph.rs`, `services/engine/src/chunk.rs`
 - Test: `services/engine/tests/graph.rs`
 
 **Interfaces:**
@@ -403,17 +410,28 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `graph::Graph { nodes: Vec<Node>, edges: Vec<Edge>, stats: Stats }`
   - `Node { label: &'static str, id: String, props: serde_json::Map<String, Value> }`
   - `Edge { rel: &'static str, from: String, from_label: &'static str, to: String, to_label: &'static str, props: serde_json::Map<String, Value> }`. Task 7 groups edges by `(rel, from_label, to_label)` for its `MATCH`.
-  - `Stats { files_indexed: usize, files_skipped: usize, unresolved_calls: usize }`
+  - `Stats { files_indexed: usize, skipped: Vec<Skipped>, excluded_dirs: usize, unresolved_calls: usize, chunks: usize, chunks_truncated: usize }`
+  - `Skipped { path: String, size: u64, reason: SkipReason /* TooLarge | Minified | OverrideSkip | Unparseable */ }`. Minified means `*.min.js`/`*.min.css`, or an average line length over 500 chars.
+  - `chunk::ChunkParams { max_tokens: usize, overlap_tokens: usize, max_chunks: usize, strategy: Strategy, enabled: bool }`, and `chunk::ChunkParams::resolve(cfg: &ChunkingCfg, model_max_seq: Option<usize>, remote: bool) -> ChunkParams`. `Auto` becomes `model_max_seq`, else `remote_max_tokens` for remote models, else 256 before Task 7c can ask the model.
+  - `chunk::est_tokens(s: &str) -> usize = ceil(chars / 4)`
+  - `chunk::Piece { ord: usize, start_line: usize, end_line: usize, text: String /* header + "\n" + body slice */ }`
+  - `chunk::split(header: &str, body: &str, body_start_line: usize, statements: &[(usize, usize) /* line ranges of the body's top-level statements */], p: &ChunkParams) -> (Vec<Piece>, bool /* truncated */)`. This is the algorithm in layer design §4.5.1:
+    1. Greedily pack statements into the budget `max_tokens - est_tokens(header)`.
+    2. Start each new chunk with the previous chunk's trailing statements, up to `overlap_tokens`.
+    3. A statement over the budget is split into line windows.
+    4. `Lines` strategy uses windows only.
+    5. When `enabled` is false: one piece, with the body cut to the budget.
+    6. Stop at `max_chunks` and return `truncated = true`.
   - `graph::FileGraph { nodes: Vec<Node>, edges: Vec<Edge> }`. Edges are file-local only: `CONTAINS DEFINES HAS_METHOD LOGS READS_ENV HANDLED_BY`.
-  - `graph::file_graph(ctx: &Ctx, unit: &str /* service or lib name */, relpath: &str, src: &str) -> Option<FileGraph>`: `None` when the file is skipped.
+  - `graph::file_graph(ctx: &Ctx, unit: &str /* service or lib name */, relpath: &str, src: &str, chunks: &ChunkParams) -> Result<FileGraph, SkipReason>`. `Err` when the file is skipped. Size and minified checks happen before parsing, using `indexing::limit_for`. It also emits `:Chunk` nodes (`chunk:{sym_id}:{ord}`, `layer: "structural"`, with `ord`, `start_line`, `end_line`, a redacted `text`, `text_hash`, `tokens_est`) and `CHUNK_OF` edges for every symbol with a card. A truncated symbol gets `chunks_truncated: true`.
   - `graph::workspace_graph(ctx: &Ctx) -> Result<Graph>`: Service/Datastore/EnvVar/Contract/Endpoint/Schema-from-OpenAPI nodes, plus docker edges (DEPENDS_ON CONNECTS_TO SHARES_VOLUME SETS_ENV USES_DATASTORE PROVIDES DECLARES DEFINES_SCHEMA). No per-file parsing.
   - `graph::LINK_RELS: &[&str] = &["CALLS","CALLS_API","USES_SCHEMA","IMPLEMENTED_BY","INJECTS","TEMPLATE_BINDS","USES_LIB","CONSUMES","BOUNDARY"]`
   - `graph::link(ctx: &Ctx, nodes: &[Node], workspace_edges: &[Edge]) -> (Vec<Edge>, usize /* unresolved calls */)`: computes every LINK_RELS edge from node properties (`calls`, `http_calls`, `uses_types`, `injects`, `template_url`, `imports` on File, `routes`, `qualname`, `unit`) plus `workspace_edges` (`DEPENDS_ON`, `CONNECTS_TO`, `SHARES_VOLUME` and `PROVIDES`, needed for `BOUNDARY` and `CONSUMES`). It never reads files. `BOUNDARY` is computed last, from the other link edges and `workspace_edges`.
   - `graph::build(ctx: &Ctx) -> Result<Graph>`: `workspace_graph` + every `file_graph` + `link`. Used by `--dry-run`, by `--full` and by tests.
-  - `graph::card(node: &Node) -> Option<String>`: the code-card text for Function/Class/Component/Injectable/Schema/Route: kind, qualname, signature, doc, decorators/route, log templates, file path, joined by newlines and capped at 2 KiB. `None` for other labels.
+  - `graph::card(node: &Node) -> Option<String>`: the card **header** for Function/Class/Component/Injectable/Schema/Route: kind, qualname, signature, doc, decorators/route, log templates, file path, joined by newlines and capped at 1 KiB. `None` for other labels. Every chunk of the symbol starts with this header.
   - Labels and rels are exactly those in the spec's graph model. In full:
-    - Labels: `Service Datastore File Function Class Component Injectable Schema LogStatement Route EnvVar Contract Endpoint`.
-    - Rels: `DEPENDS_ON CONNECTS_TO SHARES_VOLUME USES_LIB USES_DATASTORE CONTAINS DEFINES HAS_METHOD CALLS LOGS HANDLED_BY CALLS_API INJECTS TEMPLATE_BINDS READS_ENV SETS_ENV PROVIDES CONSUMES DECLARES IMPLEMENTED_BY DEFINES_SCHEMA USES_SCHEMA BOUNDARY`.
+    - Labels: `Service Datastore File Function Class Component Injectable Schema LogStatement Route EnvVar Contract Endpoint Chunk`.
+    - Rels: `CHUNK_OF DEPENDS_ON CONNECTS_TO SHARES_VOLUME USES_LIB USES_DATASTORE CONTAINS DEFINES HAS_METHOD CALLS LOGS HANDLED_BY CALLS_API INJECTS TEMPLATE_BINDS READS_ENV SETS_ENV PROVIDES CONSUMES DECLARES IMPLEMENTED_BY DEFINES_SCHEMA USES_SCHEMA BOUNDARY`.
     - Every node gets `props.workspace = ctx.config.workspace.name`.
   - **Node ids:**
     - `svc:{name}`, `ds:{name}`, `env:{NAME}`
@@ -455,7 +473,14 @@ The workspace setup below is already in the repo; only check it. The compose cha
   assert!(c.contains("POST /api/orders/{order_id}/pay") && c.contains("payment failed for order %s") && c.contains("app/main.py")); }
 #[test] fn ids_are_unique() { let g = build(&ctx()).unwrap(); let mut ids: Vec<_> = g.nodes.iter().map(|n| &n.id).collect(); let n = ids.len(); ids.sort(); ids.dedup(); assert_eq!(ids.len(), n); }
 #[test] fn build_skips_excluded_and_large() { /* add a 2 MiB .py and a foo.min.js to the tmp fixture; node_modules/x/index.js exists */
-  let g = build(&ctx()).unwrap(); assert!(g.nodes.iter().all(|n| !n.id.contains("node_modules") && !n.id.contains("min.js") && !n.id.contains("big.py"))); assert!(g.stats.files_skipped >= 2); }
+  let g = build(&ctx()).unwrap(); assert!(g.nodes.iter().all(|n| !n.id.contains("node_modules") && !n.id.contains("min.js") && !n.id.contains("big.py")));
+  assert!(g.stats.skipped.iter().any(|s| s.path.ends_with("big.py") && s.reason == SkipReason::TooLarge)); assert!(g.stats.skipped.iter().any(|s| s.reason == SkipReason::Minified)); }
+#[test] fn override_raises_limit() { /* same tmp fixture with indexing.overrides [{path:"**/big.py", max_file_bytes:"4MiB"}] → big.py is indexed, not in skipped */ }
+#[test] fn long_function_chunks() { /* body of 120 statements (~12k chars), ChunkParams{max_tokens:256, overlap:32, max_chunks:32, Syntax}:
+  pieces.len() > 1; every piece starts with the header; every piece's est_tokens <= 256; consecutive pieces overlap (next.start_line <= prev.end_line);
+  the union of line ranges covers the whole body; max_chunks 2 → 2 pieces and truncated == true */ }
+#[test] fn oversized_statement_falls_back_to_lines() { /* one 3k-char statement → several pieces, each within budget */ }
+#[test] fn short_symbol_one_chunk() { let g = build(&ctx()).unwrap(); assert_eq!(chunks_of(&g, &id_of(&g, "Function", "charge")).len(), 1); }
 #[test] fn deterministic() { assert_eq!(serde_json::to_string(&build(&ctx()).unwrap().nodes).unwrap(), serde_json::to_string(&build(&ctx()).unwrap().nodes).unwrap()); }
 ```
 (`id_of(g, label, "name@Owner")` is a test helper that finds the node with that label, name and optional owner.)
@@ -464,7 +489,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - **Service nodes:** one per config service and shared lib, plus one per compose service not linked to config (`kind: infra`, `image`).
   - **Datastore nodes:** from config.
   - **Docker edges:** DEPENDS_ON, CONNECTS_TO, SHARES_VOLUME and SETS_ENV from compose (inline env, env_file and Dockerfile ENV; props `source`, `file`, `line`). Compose names map to config service names.
-  - **Files:** walk each service/lib path with `walkdir`, skipping `exclude` dirs, files over 1 MiB and files where `Lang::from_path` is `None`.
+  - **Files:** walk each service/lib path with `walkdir`, skipping `exclude` dirs (counted) and files where `Lang::from_path` is `None`. Size, minified and override checks happen in `file_graph`, and their skips land in `Stats.skipped`.
   - **Call resolution, in this order:**
     1. Same file.
     2. Same service.
@@ -501,11 +526,12 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - `store::ensure_indexes(ctx: &Ctx, labels: &[&str]) -> Result<()>`: **autocommit**, outside any transaction. Creates `:<Label>(id)` and `:<Label>(workspace)`. Memgraph rejects index changes inside multi-statement transactions; confirm in its docs. "Already exists" errors are ignored.
   - `lock::IndexLock::acquire(ctx: &Ctx, wait: Duration) -> Result<IndexLock>`: takes `.ops/index.lock`, holding `{pid, started_at}`. A lock whose pid is dead is taken over. Returns `Err("index in progress (pid N, since T)")` once `wait` runs out. The lock is released on drop.
   - `enum IndexMode { Incremental, Full }`
-  - `store::IndexReport { mode, added, changed, deleted, unchanged, nodes, edges, unresolved_calls, fingerprint_changed: bool, vanished: Vec<VanishedAnchor>, run_id: String }`
+  - `store::IndexReport { mode, added, changed, deleted, unchanged, nodes, edges, unresolved_calls, fingerprint_changed: bool, vanished: Vec<VanishedAnchor>, run_id: String, skipped: Vec<Skipped>, chunks: usize, chunks_truncated: usize }`
+  - The signature of `store::index` is unchanged. `--max-file-bytes` is applied by the CLI before the call, by setting `ctx.config.indexing.max_file_bytes = EnvOr::Literal(size)` on its loaded `Ctx`. Precedence: flag, then `OPS_INDEXING__MAX_FILE_BYTES` (through the `config` crate), then `ops.yaml`.
   - `store::VanishedAnchor { knowledge_id: String, rel: String /* ABOUT|STEP|FROM|TO */, anchor_key: String, anchor_hash: String, qualname: Option<String>, unit: Option<String> }`
   - `store::index(ctx: &Ctx, mode: IndexMode, wait: Duration) -> Result<IndexReport>`. The algorithm is the layer design's §3:
     1. **Lock.** Take the lock, then run `ensure_indexes`.
-    2. **Fingerprint.** `parse_fingerprint = sha256(ops version + canonical JSON of config.services, shared_libs, contracts, exclude, docker)`. If it differs from the latest `IndexRun.parse_fingerprint`, mode becomes Full.
+    2. **Fingerprint.** `parse_fingerprint = sha256(ops version + canonical JSON of config.services, shared_libs, contracts, exclude, docker, the effective indexing section, and the resolved ChunkParams)`. If it differs from the latest `IndexRun.parse_fingerprint`, mode becomes Full.
     3. **Plan.** Walk the files, then `MATCH (f:File {workspace:$ws, layer:'structural'}) RETURN f.path, f.hash`, and diff the two.
     4. **One transaction:**
        - a. For each added or changed file: `file_graph`, then `UNWIND … MERGE (n:<Label> {id:r.id}) SET n += r` per label. `r` carries **every** structural key, with null for absent ones, which removes them. `+=` keeps `embedding` and `card_hash`, which Task 7c owns; `SET n = r` would erase them.
@@ -541,6 +567,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   edit(&ctx, "services/orders/app/main.py", |s| s.replace("def charge(", "def charge_card(").replace("charge(order_id)", "charge_card(order_id)"));
   let r = store::index(&ctx, IndexMode::Incremental, Duration::ZERO).unwrap(); assert_eq!(r.changed, 1);
   let inc = dump(&ctx); store::index(&ctx, IndexMode::Full, Duration::ZERO).unwrap(); assert_eq!(inc, dump(&ctx)); } // dump = sorted node ids+props and edge keys, excluding IndexRun
+#[test] #[ignore] fn raising_limit_picks_up_skipped() { /* 2 MiB file skipped on run 1; run 2 with ctx.config.indexing.max_file_bytes = 4MiB → fingerprint_changed, the file is indexed */ }
 #[test] #[ignore] fn kind_change_replaces_node() { /* make a fixture class subclass BaseModel → after an incremental run, exactly one node with that id exists, labelled Schema; the incremental graph equals the --full graph */ }
 #[test] #[ignore] fn deleted_file_removed() { /* delete services/worker/worker.py → its Function nodes and CALLS edges are gone; r.deleted == 1 */ }
 #[test] #[ignore] fn fingerprint_forces_reparse() { /* change a service's framework in ops.yaml → next incremental run reports fingerprint_changed and changed == every file */ }
@@ -553,7 +580,8 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - Batches of 500 rows per `UNWIND`.
   - `// ponytail: relink recomputes all link edges each run; scope it to the affected units if relink time shows up in profiles.`
 - [ ] **Step 5: CLI commands.**
-  - `ops index [--root] [--full] [--dry-run] [--wait SECS]`:
+  - `ops index [--root] [--full] [--dry-run] [--wait SECS] [--max-file-bytes SIZE] [--show-skipped]`:
+    - It prints the 20 largest skipped files with size and reason, plus the total; `--show-skipped` prints all of them. It also prints `chunks` and `chunks_truncated`.
     - `--dry-run` runs `graph::build` and prints `Stats` and per-label counts, without touching Memgraph.
     - Otherwise it runs `store::index` and prints the `IndexReport` as one line plus per-label counts.
   - `ops check [--root]`:
@@ -603,21 +631,22 @@ The workspace setup below is already in the repo; only check it. The compose cha
 - Modify: `services/engine/src/store.rs` (embedding step + fingerprint), `services/cli/src/main.rs` (`ops check` status)
 
 **Interfaces:**
-- Consumes: `store::{query, ensure_indexes}`, `EmbeddingsCfg`, `graph::card`
+- Consumes: `store::{query, ensure_indexes}`, `EmbeddingsCfg`, `chunk::ChunkParams`, `:Chunk` nodes from Task 6
 - Produces:
   - `embed::config_map(ctx: &Ctx, input_type: InputKind /* Document | Query */) -> Result<serde_json::Map>`: the module's configuration map.
     - `model` → `model_name`. `query_input_type` is used when `Query`, sent as `input_type`.
     - Null fields are omitted. `metric`, `scalar_kind`, `enabled` and `query_input_type` are never sent.
-  - `embed::ModelInfo { dimension: usize, remote_provider: Option<String> }`, and `embed::model_info(ctx) -> Result<ModelInfo>` via `CALL embeddings.model_info($cfg)`.
+  - `embed::ModelInfo { dimension: usize, remote_provider: Option<String>, max_sequence_length: Option<usize> }`, and `embed::model_info(ctx) -> Result<ModelInfo>` via `CALL embeddings.model_info($cfg)`.
   - `enum EmbedStatus { Vector(ModelInfo), TextOnly(String /* reason */) }`, and `embed::status(ctx) -> EmbedStatus`. Gives `TextOnly` when `enabled` is false, the `embeddings` module is absent (`CALL mg.procedures()` has no `embeddings.text`), or `model_info` fails.
   - `embed::embed_texts(ctx, texts: &[String], kind: InputKind) -> Result<Vec<Vec<f32>>>` via `CALL embeddings.text($texts, $cfg)`, in chunks of 256.
   - `embed::ensure_search_indexes(ctx, info: Option<&ModelInfo>, rebuild_vectors: bool) -> Result<()>`. Autocommit.
-    - Text indexes: `knowledge_text ON :Knowledge`, and `code_text` on each code label (one index per label if `CREATE TEXT INDEX` takes one label).
-    - Vector indexes, when `info` is Some: `knowledge_vec ON :Knowledge(embedding)` and `code_vec ON :Function|Class|Component|Injectable|Schema|Route(embedding)`, with `{dimension, capacity: max(1024, 2 × count), metric, scalar_kind}`.
+    - Text indexes: `knowledge_text ON :Knowledge`, `chunk_text ON :Chunk`, and `code_text` on each code label's `card` (one index per label if `CREATE TEXT INDEX` takes one label).
+    - Vector index, when `info` is Some: a single `chunk_vec ON :Chunk(embedding)`, with `{dimension, capacity: max(1024, 2 × chunk count), metric, scalar_kind}`. There are no per-symbol or per-entry vectors.
     - `rebuild_vectors` drops them first.
   - **In `store::index`**, after relink and outside the main transaction (vector indexes are READ_UNCOMMITTED):
     - **`embed_fingerprint`** = sha256 of `model`, `dimensions`, `metric` and `scalar_kind`. A change sets `rebuild_vectors` and re-embeds everything, including `:Knowledge`. It does **not** trigger a re-parse.
-    - **Re-embed only what changed:** nodes whose `card` changed (compare against a stored `card_hash`), plus every node when `rebuild_vectors` is set. `SET n.embedding = $vec, n.card_hash = $h`.
+    - **Resolve chunk parameters** with `ChunkParams::resolve(cfg, info.max_sequence_length, info.remote_provider.is_some())` **before** parsing. Pass them to `file_graph`; they're in `parse_fingerprint`.
+    - **Re-embed only what changed:** `:Chunk` nodes with no `embedding`, or whose `text_hash` differs from their `embedded_hash`, plus every chunk when `rebuild_vectors` is set. `SET c.embedding = $vec, c.embedded_hash = c.text_hash`.
     - **`--full`** always sets `rebuild_vectors`, because deleted nodes don't free vector-index memory until the index is dropped.
     - **`TextOnly`:** skip embedding, and record the reason in `IndexReport.embedding: String`.
   - `ops check` prints `embeddings: vector (local all-MiniLM-L6-v2, dim 384)`, or `remote openai, dim 1536`, or `text-only: <reason>`. It also warns when `SHOW VECTOR INDEX INFO` reports more than 2× as many vectors as live nodes.
@@ -627,7 +656,9 @@ The workspace setup below is already in the repo; only check it. The compose cha
 #[test] fn config_map_mapping() { let m = config_map(&ctx_with(r#"semantic: {embeddings: {model: "voyage/voyage-3", dimensions: 512}}"#), InputKind::Query).unwrap();
   assert_eq!(m["model_name"], "voyage/voyage-3"); assert_eq!(m["input_type"], "query"); assert_eq!(m["dimensions"], 512); assert!(!m.contains_key("metric") && !m.contains_key("api_base")); }
 #[test] fn disabled_is_text_only() { assert!(matches!(status(&ctx_with("semantic: {embeddings: {enabled: false}}")), EmbedStatus::TextOnly(_))); }
-#[test] #[ignore] fn embeds_cards_default_model() { /* MAGE image: index fixture → every Function has `embedding` of length 384; second incremental run re-embeds 0; editing pay's docstring re-embeds exactly 1 */ }
+#[test] #[ignore] fn embeds_chunks_default_model() { /* MAGE image: index fixture → every :Chunk has `embedding` of length 384 and ChunkParams.max_tokens resolved to 256 (all-MiniLM-L6-v2's max_sequence_length);
+  second incremental run re-embeds 0; editing one statement in a long fixture function re-embeds at most 2 chunks (overlap) and none of its other chunks */ }
+#[test] #[ignore] fn long_function_found_by_its_tail() { /* fixture function of ~200 lines whose last block mentions "refund ledger"; search over chunk_vec for "refund ledger reconciliation" ranks that function first (Part 2 search uses the same query) */ }
 #[test] #[ignore] fn model_change_rebuilds() { /* change model to another local model with a different dim → vector index recreated with the new dimension; report.changed == 0 (no re-parse) */ }
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine embed`. Expected: FAIL.
@@ -653,7 +684,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `semantic::NewEntry { kind, title, body, confidence, evidence, tags, anchors: Vec<String> /* ids */, steps, from, to, author_client, author_model, session_id }`, and `semantic::create(ctx, NewEntry) -> Result<String /* "k:" + uuid v4 */>`.
     - Validates: title ≤ 120 chars, body ≤ 8 KiB, evidence ≤ 20 items, at least one anchor (flow: ≥ 2 steps; relation: from and to).
     - Redacts `title`, `body` and `evidence`.
-    - Writes `:Knowledge {…, workspace, layer:'semantic'}` plus `ABOUT/STEP{order}/FROM/TO {anchor_key, anchor_hash}` edges, then embeds `title + body + tags` when `embed::status` is `Vector`.
+    - Writes `:Knowledge {…, workspace, layer:'semantic'}` plus `ABOUT/STEP{order}/FROM/TO {anchor_key, anchor_hash}` edges. When `embed::status` is `Vector`, it then writes the entry's chunks: `chunk::split` with header `title + tags` and body `body`, as `:Chunk {id: chunk:{k_id}:{ord}, layer:'semantic'}-[:CHUNK_OF]->(k)`, and embeds them. `revise` writes chunks for the new entry; a retracted entry keeps its chunks, and search filters them out.
     - Retries up to 3 times on a Memgraph transaction conflict (match the error text from Memgraph's docs).
   - `semantic::get(ctx, id) -> Result<Entry>`, and `semantic::about(ctx, node_ids: &[String], include_stale: bool) -> Result<Vec<Entry>>`: entries anchored (`ABOUT`/`STEP`/`FROM`/`TO`) to any of the nodes, excluding `retracted`.
   - `semantic::revise(ctx, id, patch: Patch) -> Result<String>`: a new entry that `SUPERSEDES` the old one; the old one gets `status: retracted`.
@@ -663,7 +694,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - **Surviving anchors:** recompute `anchor_hash`. If it differs: `status: stale`, `stale_since: run_id`.
     - **`report.vanished`:** if exactly one symbol in the same `unit` has the same `qualname`, re-create the edge to it and mark the entry stale. Otherwise add the `anchor_key` to `orphaned_anchors`; once the entry has no live anchors, set `status: orphaned`.
     - `retracted` entries are skipped.
-  - `semantic::export(ctx, dir: &Path) -> Result<usize>`: writes `<dir>/knowledge.jsonl`, one entry per line.
+  - `semantic::export(ctx, dir: &Path) -> Result<usize>`: writes `<dir>/knowledge.jsonl`, one entry per line, with no `:Chunk` data (import recomputes it).
     - Sorted by id. Keys within each object are sorted. Anchors are given by `anchor_key`, never by internal ids or vectors.
     - Ends with a trailing newline.
   - `semantic::import(ctx, dir: &Path) -> Result<ImportReport { created, updated, skipped }>`: merges by id, and the newer `updated_at` wins.

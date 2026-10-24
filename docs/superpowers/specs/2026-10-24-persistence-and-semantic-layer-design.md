@@ -122,9 +122,36 @@ Indexes are created beforehand, in autocommit (base plan, Task 7).
 run didn't produce, then runs §4.3. It never wipes the layer, so semantic anchors on surviving
 nodes are never cut.
 
-**Forced full re-parse.** `IndexRun` stores a `fingerprint`: the ops version plus a hash of the
-config sections that affect extraction (`services`, `shared_libs`, `contracts`, `exclude`,
-`docker`). When it differs from the last run, every file is treated as `changed`.
+**Forced full re-parse.** `IndexRun` stores two fingerprints:
+- **`parse_fingerprint`** covers the ops version plus the config sections that affect extraction:
+  `services`, `shared_libs`, `contracts`, `exclude`, `docker`, `indexing` (§3.1), and the
+  *resolved* chunk parameters (§4.5.1). When it changes, every file is treated as `changed`.
+- **`embed_fingerprint`** covers `model`, `dimensions`, `metric` and `scalar_kind`. When it
+  changes, the vector indexes are rebuilt and everything re-embedded, but nothing is re-parsed.
+
+### 3.1 File size limits (configurable)
+Chunking a *file* for parsing is deliberately not done. The parser needs the whole file to build
+a correct syntax tree; symbols that cross a chunk boundary would be lost or misread, and large
+files parse fine anyway. The size limit exists to keep generated noise (bundles, lockfiles,
+vendored code, generated clients) out of the graph, so it's a setting:
+
+```yaml
+indexing:
+  max_file_bytes: 1MiB          # B / KiB / MiB / GiB, or a plain number of bytes; 0 = no limit
+  skip_minified: true           # *.min.js / *.min.css, and files whose average line exceeds 500 chars
+  overrides:                    # first matching glob (relative to the workspace root) wins
+    - { path: "services/legacy/**/*.py", max_file_bytes: 8MiB }
+    - { path: "**/generated/**", skip: true }
+```
+- **Set right before indexing:** `ops index --max-file-bytes 8MiB`, or
+  `OPS_INDEXING__MAX_FILE_BYTES=8MiB` (works for `ops watch` and `reindex` too). The flag wins
+  over the env var, and the env var wins over `ops.yaml`.
+- `indexing` is part of `parse_fingerprint`, so raising the limit picks the previously skipped
+  files up on the next run.
+- **Skips are reported, not silent.** `IndexReport.skipped` lists `{path, size, reason}`, with
+  reason `too_large`, `minified`, `override_skip` or `unparseable`. Excluded directories are only
+  counted. `ops index` prints the 20 largest skips and the total; `--show-skipped` prints all of
+  them. `ops check` shows the count.
 
 **One writer at a time.** `ops index`, `ops watch` and the MCP `reindex` tool all take an exclusive
 lock file, `.ops/index.lock` (holding pid and start time; locks left by a dead process are taken
@@ -259,23 +286,72 @@ Memgraph's docs and repo at v3.14.0.
 | Node | Text that gets embedded | When |
 |---|---|---|
 | `:Knowledge` | `title + body + tags` | on `remember` / `revise` |
-| Function, Class, Component, Injectable, Schema, Route | a **code card**: kind, qualname, signature, docstring, decorators/route, log templates, file path. Stored as the `card` property. | on index, for added/changed nodes only (when `card` changed) |
+| Function, Class, Component, Injectable, Schema, Route | its **chunks** (§4.5.1): each one is the symbol's *card header* (kind, qualname, signature, docstring, decorators/route, log templates, file path) followed by a slice of its **body source**. A short symbol has one chunk. | on index, only for chunks whose `text_hash` changed |
 
-- ops-support calls `embeddings.text([...])` itself and `SET`s `n.embedding`. It doesn't use
+- ops-support calls `embeddings.text([...])` itself and `SET`s `chunk.embedding`. It doesn't use
   `node_sentence`, which embeds every string property.
+- Long `:Knowledge` bodies (up to 8 KiB) are chunked the same way: title and tags as the header,
+  then slices of the body.
 - Text is already redacted when it's embedded.
 - The Part 1 extractors also capture docstrings / JSDoc for the card.
 
+#### 4.5.1 Chunking long symbols (configurable)
+Embedding models read a bounded number of tokens (all-MiniLM-L6-v2: 256) and silently ignore the
+rest. So a long function embedded as one piece is searchable only by its first lines. Each
+symbol is therefore embedded as **overlapping chunks**, and search scores a symbol by its
+best-matching chunk.
+
+**Model:**
+`(:Chunk {id, ord, start_line, end_line, text, text_hash, tokens_est, embedding, workspace, layer})-[:CHUNK_OF]->(symbol | :Knowledge)`
+- Code chunks have id `chunk:{sym_id}:{ord}` and `layer: "structural"`. They're produced by
+  `file_graph`, so incremental indexing creates, updates and deletes them like any other node.
+- Knowledge chunks have id `chunk:{k_id}:{ord}` and `layer: "semantic"`. They're rewritten on
+  `remember`/`revise`, never touched by indexing, and left out of the export (recomputed on import).
+- `text` is stored so a model change can re-embed without re-parsing. It's redacted before it's
+  stored, like everything else.
+
+**Splitting:**
+- `strategy: syntax` (default) packs the symbol body's top-level statements greedily up to the
+  token budget, overlapping each chunk with the tail of the previous one by `overlap_tokens`.
+- A single statement larger than the budget falls back to line windows.
+- `strategy: lines` uses line windows only.
+- The budget is `max_tokens` minus the header's tokens. Tokens are estimated as `ceil(chars / 4)`;
+  ops-support has no tokenizer, and the estimate is deliberately conservative.
+- Past `max_chunks_per_symbol`, the remaining body is dropped and the symbol gets
+  `chunks_truncated: true`. `ops index` reports how many symbols were truncated.
+
+**Configuration** (under `semantic.embeddings.chunking`):
+```yaml
+semantic:
+  embeddings:
+    chunking:
+      enabled: true              # false = one chunk per symbol: header + body cut at max_tokens
+      max_tokens: auto           # auto = the model's max_sequence_length from embeddings.model_info;
+                                 #        remote models report none, so remote_max_tokens applies
+      remote_max_tokens: 512
+      overlap_tokens: 32
+      max_chunks_per_symbol: 32
+      strategy: syntax           # syntax | lines
+      aggregate: max             # how a symbol's chunks score: max | mean_top2
+```
+The *resolved* values (with `auto` turned into a number) are part of `parse_fingerprint`.
+Changing them re-chunks everything on the next run. A model swap that keeps the same resolved
+`max_tokens` only re-embeds.
+
 **Indexes** (created idempotently in autocommit before each index run, like the other indexes):
-- `knowledge_vec ON :Knowledge(embedding)` and `code_vec ON :Function|Class|Component|Injectable|Schema|Route(embedding)`.
+- `chunk_vec ON :Chunk(embedding)`, one vector index for code and knowledge chunks, filtered by
+  `CHUNK_OF` target and `layer` at query time.
   `metric: "cos"`, `dimension` from `embeddings.model_info`, `capacity` = 2 × the current count.
-- Text indexes: `knowledge_text ON :Knowledge`, plus one per code label. *Builder: confirm whether
+- Text indexes: `knowledge_text ON :Knowledge`, `chunk_text ON :Chunk`, plus one per code label (on `card`). *Builder: confirm whether
   `CREATE TEXT INDEX` takes several labels; if not, create one per label.*
 
 **Querying:**
 1. `embeddings.text([query])`.
-2. `vector_search.search(index, k*3, vec)` and `text_search.search(index, query)`.
-3. Merge the two with reciprocal-rank fusion.
+2. `vector_search.search("chunk_vec", k*5, vec)`, then follow `CHUNK_OF` to the symbol or entry.
+   Aggregate per parent with `aggregate` (`max`, or the mean of the top two), keeping the best
+   chunk's `start_line`–`end_line`.
+3. `text_search.search` over the text indexes, then merge the two rankings with reciprocal-rank
+   fusion.
 4. Boost hits within 2 hops of `target` / `service`.
 5. Drop `retracted` hits, and flag `stale` ones.
 
@@ -354,7 +430,7 @@ semantic:
 - Options the module has but ops-support sets itself (`embedding_property`,
   `excluded_properties`, `return_embeddings`) are not user-facing, because ops-support always uses
   `embeddings.text`.
-- `model`, `dimensions`, `metric` and `scalar_kind` are part of the index fingerprint (§3).
+- `model`, `dimensions`, `metric` and `scalar_kind` are part of `embed_fingerprint`, and the resolved chunk parameters are part of `parse_fingerprint` (§3).
   Changing any of them drops and recreates the vector indexes and re-embeds every card and entry.
 - `ops check` calls `embeddings.model_info` with this config and reports which path is in use
   (local, or remote with the provider name), the dimension, and any load or auth error.
