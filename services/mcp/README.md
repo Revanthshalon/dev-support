@@ -22,7 +22,7 @@ ops-mcp --root /path/to/workspace --mode operational-support
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--root` | `$OPS_ROOT`, then the current directory | Workspace containing `ops.yaml` |
+| `--root` | `$OPS_ROOT`, else the nearest ancestor directory containing `ops.yaml` | Workspace containing `ops.yaml` |
 | `--mode` | `operational-support` | Which bundle of tools, prompts and instructions to serve |
 
 Register it with Claude Code:
@@ -31,8 +31,9 @@ Register it with Claude Code:
 claude mcp add ops -- ops-mcp --root /path/to/workspace --mode operational-support
 ```
 
-or use the `.mcp.json` that `ops init` writes. GitHub Copilot CLI connects to the same stdio
-server; `ops init` writes or prints its MCP config snippet. Both clients share one graph and one
+or use the `.mcp.json` that `ops init` writes. GitHub Copilot CLI reads the same project-level
+`.mcp.json`, so one file serves both clients. The entry has no `--root`; `ops-mcp` finds the
+workspace by walking up to `ops.yaml`, or from `OPS_ROOT`. Both clients share one graph and one
 semantic layer, and each knowledge entry records which client and model wrote it.
 
 The workspace must be indexed first (`ops index`). The server still starts without Memgraph or
