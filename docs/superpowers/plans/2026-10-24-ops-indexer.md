@@ -6,14 +6,14 @@
 
 **Architecture:** All logic lives in the `engine` library. `cli` is a thin clap binary. Graph building is a pure function (`graph::build`) that returns nodes and edges, so it is tested without a database. `store` is the only module that talks to Memgraph (rsmgclient, synchronous, wrapped in `spawn_blocking`).
 
-**Tech Stack:** Rust 2024, clap 4.6 (derive), config 0.15 (yaml), serde, serde_norway 0.9, serde_json, regex, walkdir, shlex, tree-sitter 0.27 + tree-sitter-python 0.25, tree-sitter-typescript 0.23, tree-sitter-html 0.23, tree-sitter-css 0.25, rsmgclient 4.0, tokio, anyhow.
+**Tech Stack:** Rust 2024, clap 4.6 (derive), config 0.15 (yaml), serde, serde_norway 0.9, serde_json, regex, walkdir, shlex, tree-sitter 0.27 + tree-sitter-python 0.25, tree-sitter-typescript 0.23, tree-sitter-html 0.23, tree-sitter-css 0.25, tree-sitter-yaml 0.7, tree-sitter-json 0.24, tree-sitter-containerfile 0.9, rsmgclient 4.0, tokio, anyhow.
 
 **Spec:** `docs/superpowers/specs/2026-10-24-ops-support-design.md`
 
 ## Global Constraints
 - The workspace stays `services/{engine,cli,mcp}`. The `cli` binary is named `ops`, and the `mcp` binary is named `ops-mcp`.
 - Shared crate versions go in root `[workspace.dependencies]`; member crates use `{ workspace = true }`.
-- No `neo4rs`. No grammars beyond python/typescript/html/css. No MySQL or SQLite drivers.
+- No `neo4rs`. Grammars are exactly python, typescript, html, css, yaml, json and containerfile (all already in the workspace). No MySQL or SQLite drivers.
 - A secret field is `Secret = Literal(String) | { env: String }`. Secret values never appear in `Debug` output, logs or errors.
 - Node ids are deterministic and unique within a workspace (see Task 6).
 - Every file skipped on purpose (excluded dir, >1 MiB, `*.min.js`, unparseable) is counted, not fatal.
@@ -36,7 +36,7 @@
 Already in the repo when this plan starts. Don't redo it; only check it.
 
 - Root `Cargo.toml`: members `services/{engine,cli,mcp}`; `[workspace.package]` (edition 2024, rust-version, `publish = false`); every shared crate version in `[workspace.dependencies]`; workspace lints (`unsafe_code = "forbid"`, clippy `all` warn).
-- Binaries: `cli` → `ops`, `mcp` → `ops-mcp`. `engine` is a library stub.
+- Binaries: `cli` → `ops`, `mcp` → `ops-mcp`. `engine` is a library stub that already declares every Part 1 dependency, including the tree-sitter grammars for python, typescript, html, css, yaml, json and containerfile.
 - `deny.toml`: advisories (vulnerable/unmaintained/yanked = deny), license allow-list, bans (wildcards deny, multiple-versions warn), sources (crates.io only).
 - `docker-compose.yml`: memgraph uses named volumes `memgraph_data` and `memgraph_log`; credentials come from `.env`.
 - `.env.example`, `.gitignore`, `rust-toolchain.toml`, and a `README.md` covering overview, architecture, configuration and setup.
@@ -107,15 +107,19 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 ### Task 2: Compose and Dockerfile parsing
 
 **Files:**
-- Create: `services/engine/src/docker.rs`
+- Create: `services/engine/src/docker.rs`, `services/engine/src/spans.rs`
+
+**Parsing split.** Values come from `serde_norway`, which handles YAML anchors and `<<:` merge keys. tree-sitter-yaml and tree-sitter-json supply only source lines, so findings can cite `file:line`. Dockerfiles are parsed entirely with tree-sitter-containerfile.
 
 **Interfaces:**
 - Produces:
-  - `docker::ComposeService { name, image: Option<String>, build: Option<String> /* workspace-relative context */, dockerfile: Option<String>, depends_on: Vec<String>, environment: Vec<(String,String)>, env_files: Vec<String>, ports: Vec<String>, volumes: Vec<String> /* named volumes only */, file: String }`
+  - `spans::Spans` (`BTreeMap<String, usize>`): dotted key path → 1-based line, with sequence items indexed (`services.orders.environment.0`, `services.orders.environment.DATABASE_URL`).
+  - `spans::yaml(src: &str) -> Spans`, `spans::json(src: &str) -> Spans`. They tolerate parse errors and return what they can.
+  - `docker::ComposeService { name, image: Option<String>, build: Option<String> /* workspace-relative context */, dockerfile: Option<String>, depends_on: Vec<String>, environment: Vec<(String,String)>, env_files: Vec<String>, ports: Vec<String>, volumes: Vec<String> /* named volumes only */, file: String, line: usize /* the service key */, env_lines: BTreeMap<String, usize> /* env key → line, inline env only */ }`
   - `docker::parse_compose(src: &str, base: &Path, file: &str) -> Result<Vec<ComposeService>>`
   - `docker::load_compose(ctx: &Ctx) -> Result<Vec<ComposeService>>`: every `docker.compose_files` entry, with `env_file` contents merged into `environment` (file values lose to inline ones).
   - `docker::connections(svc, all) -> Vec<(String /*target*/, String /*env key*/)>`
-  - `docker::Dockerfile { base_image: Option<String>, expose: Vec<u16>, env: Vec<(String,String)>, entrypoint: Vec<String> /* ENTRYPOINT ++ CMD, exec or shell form */ }`
+  - `docker::Dockerfile { stages: Vec<Stage { name: Option<String>, base_image: String, line: usize }>, expose: Vec<(u16, usize)>, env: Vec<(String, String, usize)>, entrypoint: Vec<String> /* ENTRYPOINT ++ CMD, exec or shell form */, entrypoint_line: Option<usize> }` (the final stage; `line` is 1-based)
   - `docker::parse_dockerfile(src: &str) -> Dockerfile`
   - `docker::normalize(p: &Path) -> String` (lexical `..`/`.` cleanup)
 
@@ -129,13 +133,21 @@ Already in the repo when this plan starts. Don't redo it; only check it.
   assert_eq!(connections(&api, &all), [("cache".into(),"REDIS".into()), ("db".into(),"DATABASE_URL".into())]); }
 #[test] fn dockerfile_cmd_forms() { assert_eq!(parse_dockerfile("FROM python:3.12\nEXPOSE 8000\nENV A=1 B=2\nENTRYPOINT [\"uvicorn\"]\nCMD [\"app.main:app\",\"--port\",\"8000\"]").entrypoint, ["uvicorn","app.main:app","--port","8000"]);
   assert_eq!(parse_dockerfile("CMD python -m worker.run").entrypoint, ["python","-m","worker.run"]); }
+#[test] fn spans_point_at_lines() { let s = spans::yaml("services:\n  api:\n    environment:\n      - A=1\n      B: 2\n"); assert_eq!(s["services.api"], 2); assert_eq!(s["services.api.environment.0"], 4);
+  assert_eq!(spans::json("{\n \"paths\": {\n  \"/a\": {}\n }\n}")["paths./a"], 3); }
+#[test] fn compose_env_lines_and_anchors() { /* x-common: &env {LOG: debug}; api: environment: {<<: *env, DB_URL: postgres://db}
+  → api.environment has LOG and DB_URL (merge key honored); api.env_lines["DB_URL"] == its line; api.line == line of "api:" */ }
+#[test] fn dockerfile_heredoc_and_stages() { let d = parse_dockerfile("FROM node:20 AS build\nRUN <<EOF\nnpm ci\nEOF\nFROM python:3.12\nENV A=1\nEXPOSE 8000\nCMD [\"python\",\"-m\",\"w\"]\n");
+  assert_eq!(d.stages.len(), 2); assert_eq!(d.stages[0].name.as_deref(), Some("build")); assert_eq!(d.env, [("A".into(), "1".into(), 6)]);
+  assert_eq!(d.expose, [(8000, 7)]); assert_eq!(d.entrypoint_line, Some(8)); }
 #[test] fn this_repos_compose_parses() { /* parse ../../docker-compose.yml: memgraph has volumes ["memgraph_data","memgraph_log"], lab depends_on ["memgraph"] */ }
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine docker`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
   - Compose goes through `serde_norway::Value`; the schema is too loose for derive.
   - Sort `connections` output so tests are deterministic. The hostname regex is `(^|[/@=\s,])NAME(:\d+|/|$|\s|,)`.
-  - Dockerfile: join `\` continuation lines. `ENV k=v k2=v2` and the legacy `ENV k v` forms. Shell-form CMD is split with `shlex`. A later CMD/ENTRYPOINT replaces an earlier one, and the last stage wins.
+  - Dockerfile: walk the tree-sitter-containerfile tree (`from_instruction`, `env_instruction`, `expose_instruction`, `cmd_instruction`, `entrypoint_instruction`; check the exact node kinds in the grammar's `node-types.json`). Support `ENV k=v k2=v2` and the legacy `ENV k v` form. Split shell-form CMD with `shlex`. A later CMD/ENTRYPOINT replaces an earlier one, `ENTRYPOINT ++ CMD` is concatenated, and the last stage wins.
+  - Compose: values from `serde_norway::Value`, after applying merge keys. Fill `line`/`env_lines` from `spans::yaml` using `services.<name>` and `services.<name>.environment.<KEY|index>`.
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit.** `git commit -am "feat(engine): compose and Dockerfile parsing"`
 
@@ -205,7 +217,7 @@ Already in the repo when this plan starts. Don't redo it; only check it.
   - **Workspace kind:** one unit → `single`; one `.git` at root or none → `monorepo`; several `.git` dirs → `multi-repo`.
   - **LSP defaults:** python `[pyright-langserver, --stdio]`; ts/js `[typescript-language-server, --stdio]`.
   - **Logs default:** `compose` when linked, else none. When `kubectl config current-context` succeeds, write a commented-out `kubernetes:` example in the header comment, not live config.
-  - **`.mcp.json`:** `{"mcpServers":{"ops":{"command":"ops-mcp","args":["--root","."]}}}`.
+  - **`.mcp.json`:** `{"mcpServers":{"ops":{"command":"ops-mcp","args":["--root",".","--mode","operational-support"]}}}`.
   - **`.gitignore`:** append `.env` if a `.gitignore` exists and lacks it.
   - Sort services and datastores by name.
 - [ ] **Step 4: Add the CLI subcommand.** `ops init [--root DIR] [--force]` prints each written path, then: "edit ops.yaml, copy .env.example to .env, run `ops check`".
@@ -320,14 +332,15 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 - Create: `services/engine/src/contract.rs`
 
 **Interfaces:**
+- Consumes: `spans::yaml`, `spans::json` (Task 2)
 - Produces:
-  - `contract::OpenApi { title: Option<String>, endpoints: Vec<(String /*METHOD*/, String /*path*/)>, schemas: Vec<String> }`
+  - `contract::OpenApi { title: Option<String>, endpoints: Vec<(String /*METHOD*/, String /*path*/, usize /*line*/)>, schemas: Vec<(String, usize /*line*/)> }`. Lines come from `spans::yaml` or `spans::json`.
   - `contract::parse_openapi(src: &str) -> Result<OpenApi>`: YAML or JSON (try JSON first, then YAML), OpenAPI 3.x. Endpoints come from `paths.*.{get,post,put,patch,delete,head,options}`, with `servers[0].url`'s path prepended when it has one. Schemas are the keys of `components.schemas`.
 
 - [ ] **Step 1: Failing tests**
 ```rust
-#[test] fn parses_fixture() { let o = parse_openapi(ORDERS_OPENAPI).unwrap(); assert_eq!(o.endpoints, [("POST".into(), "/api/orders/{order_id}/pay".into())]); assert_eq!(o.schemas, ["PayRequest"]); }
-#[test] fn server_base_path_and_json() { let o = parse_openapi(r#"{"openapi":"3.0.0","servers":[{"url":"https://x.io/v1"}],"paths":{"/a":{"get":{}}}}"#).unwrap(); assert_eq!(o.endpoints, [("GET".into(), "/v1/a".into())]); }
+#[test] fn parses_fixture() { let o = parse_openapi(ORDERS_OPENAPI).unwrap(); assert_eq!(o.endpoints.iter().map(|(m,p,_)| (m.as_str(), p.as_str())).collect::<Vec<_>>(), [("POST", "/api/orders/{order_id}/pay")]); assert!(o.endpoints[0].2 > 1); assert_eq!(o.schemas[0].0, "PayRequest"); }
+#[test] fn server_base_path_and_json() { let o = parse_openapi(r#"{"openapi":"3.0.0","servers":[{"url":"https://x.io/v1"}],"paths":{"/a":{"get":{}}}}"#).unwrap(); assert_eq!((o.endpoints[0].0.as_str(), o.endpoints[0].1.as_str()), ("GET", "/v1/a")); }
 #[test] fn rejects_non_openapi() { assert!(parse_openapi("services: {}").is_err()); }
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine contract`. Expected: FAIL.
@@ -348,10 +361,13 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 - Produces:
   - `graph::Graph { nodes: Vec<Node>, edges: Vec<Edge>, stats: Stats }`
   - `Node { label: &'static str, id: String, props: serde_json::Map<String, Value> }`
-  - `Edge { rel: &'static str, from: String, to: String, props: serde_json::Map<String, Value> }`
+  - `Edge { rel: &'static str, from: String, from_label: &'static str, to: String, to_label: &'static str, props: serde_json::Map<String, Value> }`. Task 7 groups edges by `(rel, from_label, to_label)` for its `MATCH`.
   - `Stats { files_indexed: usize, files_skipped: usize, unresolved_calls: usize }`
   - `graph::build(ctx: &Ctx) -> Result<Graph>`
-  - Labels and rels are exactly those in the spec's graph model. Every node gets `props.workspace = ctx.config.workspace.name`.
+  - Labels and rels are exactly those in the spec's graph model. In full:
+    - Labels: `Service Datastore File Function Class Component Injectable Schema LogStatement Route EnvVar Contract Endpoint`.
+    - Rels: `DEPENDS_ON CONNECTS_TO SHARES_VOLUME USES_LIB USES_DATASTORE CONTAINS DEFINES HAS_METHOD CALLS LOGS HANDLED_BY CALLS_API INJECTS TEMPLATE_BINDS READS_ENV SETS_ENV PROVIDES CONSUMES DECLARES IMPLEMENTED_BY DEFINES_SCHEMA USES_SCHEMA BOUNDARY`.
+    - Every node gets `props.workspace = ctx.config.workspace.name`.
   - **Node ids:**
     - `svc:{name}`, `ds:{name}`, `env:{NAME}`
     - `file:{svc}:{relpath}`
@@ -394,7 +410,7 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 - [ ] **Step 3: Implement `build`.**
   - **Service nodes:** one per config service and shared lib, plus one per compose service not linked to config (`kind: infra`, `image`).
   - **Datastore nodes:** from config.
-  - **Docker edges:** DEPENDS_ON, CONNECTS_TO, SHARES_VOLUME and SETS_ENV from compose (inline env, env_file and Dockerfile ENV, `source` prop). Compose names map to config service names.
+  - **Docker edges:** DEPENDS_ON, CONNECTS_TO, SHARES_VOLUME and SETS_ENV from compose (inline env, env_file and Dockerfile ENV; props `source`, `file`, `line`). Compose names map to config service names.
   - **Files:** walk each service/lib path with `walkdir`, skipping `exclude` dirs, files over 1 MiB and files where `Lang::from_path` is `None`.
   - **Call resolution, in this order:**
     1. Same file.
@@ -426,8 +442,8 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 - Consumes: `Ctx`, `graph::Graph`
 - Produces (Part 2 depends on these):
   - `store::write(ctx: &Ctx, g: &Graph) -> Result<()>`: synchronous.
-    - Ensures `CREATE INDEX ON :<Label>(id)` for every label used, and `:<Label>(workspace)`.
-    - Then `MATCH (n {workspace:$ws}) DETACH DELETE n`.
+    - First, in **autocommit mode, outside the write transaction**: `CREATE INDEX ON :<Label>(id)` for every label used, and `:<Label>(workspace)`. Memgraph rejects index changes inside a multi-statement transaction ("Index manipulation not allowed in multicommand transactions"); confirm against the Memgraph docs while doing Step 1. Ignore errors that only say the index already exists.
+    - Then, in one transaction: `MATCH (n {workspace:$ws}) DETACH DELETE n`.
     - Then nodes per label in batches of 500: `UNWIND $rows AS r CREATE (n:<Label>) SET n = r`.
     - Then edges per `(rel, from_label, to_label)`: `UNWIND $rows AS r MATCH (a:<From> {id:r.from}), (b:<To> {id:r.to}) CREATE (a)-[e:<REL>]->(b) SET e = r.props`.
     - Commits once at the end.

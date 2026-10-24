@@ -34,6 +34,9 @@ tree-sitter-python = "0.25.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
+tree-sitter-yaml = "0.7.2"            # docker compose, OpenAPI (YAML): source spans
+tree-sitter-json = "0.24.8"            # OpenAPI (JSON): source spans
+tree-sitter-containerfile = "0.9.2"    # Dockerfile / Containerfile (heredocs, multi-stage)
 
 # Graph store and datastores
 rsmgclient = "4.0.0"
