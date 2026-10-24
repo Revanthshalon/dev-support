@@ -53,7 +53,7 @@ onto the code flow, checks configuration, and inspects datastores read-only.
 ```
 Cargo.toml              workspace: shared versions, lints
 deny.toml               dependency audit policy (cargo-deny)
-docker-compose.yml      Memgraph + Memgraph Lab; data bind-mounted at docker/memgraph/ (planned)
+docker-compose.yml      Memgraph + Memgraph Lab; data bind-mounted at docker/memgraph/
 docker-compose.gpu.yml  optional GPU override for local embedding models (planned)
 .env.example            credentials template (copy to .env)
 services/
@@ -91,6 +91,10 @@ docker compose up -d              # Memgraph on :7687, Lab UI on http://localhos
 cargo build --workspace
 cargo deny check                  # must pass before any dependency change is merged
 ```
+
+**Memgraph Lab** (<http://localhost:3000>): choose *Connect manually* and enter host `memgraph`,
+port `7687`, and `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` from `.env`. Quick-connect is turned off
+because it can't send credentials and Memgraph has auth on.
 
 Memgraph data is bind-mounted at `docker/memgraph/` (`lib/` for data and the embedding-model
 cache, `log/` for logs; git-ignored). It survives `docker compose down` and restarts: Memgraph

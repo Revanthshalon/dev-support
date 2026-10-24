@@ -62,6 +62,8 @@ services:
       - "3000:3000"
     depends_on:
       - memgraph
+    # Lab's quick-connect is anonymous-only (no username/password setting), and Memgraph has auth on,
+    # so it would fail every 2 s. Log in via "Connect manually": host memgraph, port 7687, and
+    # MEMGRAPH_USER / MEMGRAPH_PASSWORD from .env.
     environment:
-      - QUICK_CONNECT_MG_HOST=memgraph
-      - QUICK_CONNECT_MG_PORT=7687
+      - QUICK_CONNECT_IS_DISABLED=true
