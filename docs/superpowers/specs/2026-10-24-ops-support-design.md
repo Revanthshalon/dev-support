@@ -35,14 +35,24 @@ the code flow, inspect configuration and datastores, determine the root cause an
 - **Graph driver:** `rsmgclient` (not `neo4rs`).
 - **Supply chain:** every dependency must pass `cargo deny check` (advisories, licenses, bans,
   sources), configured in `deny.toml`.
-- **Memgraph persistence:** named docker volumes so data survives `docker compose down`.
+- **Persistence, incremental indexing and the semantic layer** are specified in
+  [`2026-10-24-persistence-and-semantic-layer-design.md`](2026-10-24-persistence-and-semantic-layer-design.md)
+  ("the layer design"), which wins where the two documents differ. In short:
+  - Memgraph data is bind-mounted at `docker/memgraph/{lib,log}`.
+  - `ops index` is incremental (`--full` re-parses everything), and `ops watch` keeps the index current.
+  - LLM-written understanding lives in a separate, drift-tracked `:Knowledge` layer that indexing
+    never deletes. It's backed up to a committed `ops-knowledge/` export.
+  - Search by meaning uses Memgraph's native embeddings, vector and text indexes (Community edition).
+  - Incident reports are saved as files and searched as the first reference. There's no incident
+    memory in the graph.
 
 ## Repository layout
 ```
 Cargo.toml                 workspace: services/{engine,cli,mcp}
-docker-compose.yml         memgraph + lab, named volumes
+docker-compose.yml         memgraph (bind mount docker/memgraph/) + lab; `embeddings` profile for warmup
+docker-compose.gpu.yml     optional NVIDIA GPU override for local embedding models
 services/engine            library: config, discovery, parsing, graph, store, logs, datastores, lsp
-services/cli               binary `ops`: init | index | check
+services/cli               binary `ops`: init | check | index [--full] | watch | knowledge export/import
 services/mcp               binary `ops-mcp`: stdio MCP server (rmcp 3.7)
 services/mcp/templates     incident-report.md (used by `write_rca`)
 ```
@@ -92,11 +102,25 @@ logging:                                            # optional; these are the de
   dir: .ops/logs                                    # relative to the workspace root
   retention_days: 14
   audit: true                                       # per-tool-call audit records
+semantic:                                           # optional; full option list in the layer design §4.5
+  embeddings:
+    enabled: true
+    model: { env: EMBEDDINGS_MODEL, default: all-MiniLM-L6-v2 }   # "provider/model" = remote via LiteLLM
+incidents:
+  dir: docs/incidents                               # where write_rca reports are saved
 ```
 `ops init` also writes `.env.example` (every `env:` name referenced) and `.mcp.json`.
 
 ## Graph model
-Every node carries `id` and `workspace`.
+Every node carries `id` and `workspace`. Structural nodes (everything below) also carry
+`layer: "structural"`.
+- **Ids have no line numbers**, e.g. `sym:{service}:{path}:{qualname}`, so they're stable across edits.
+- Symbols carry `body_hash`, `card` (code-card text) and `embedding`.
+- Files carry their content `hash`.
+- `(:IndexRun)` records each run.
+
+The semantic layer (`:Knowledge` with `ABOUT`/`STEP`/`FROM`/`TO`/`SUPERSEDES`) is defined in the
+layer design §4.
 ```
 (:Service {name, kind: service|library|infra, language, framework, image})
 (:Service)-[:DEPENDS_ON]->(:Service)              compose depends_on
@@ -175,10 +199,12 @@ This section is the `operational-support` mode, the MVP.
 
 **Tools.** Graph and code: `service_map` (boundaries with evidence), `contract`, `find_symbol`, `code_context`, `trace_flow`, `read_file`,
 `graph_query`, `lsp`. Operations: `fetch_logs`, `match_log`, `analyze_logs`, `compose_status`,
-`k8s_status`, `service_config`, `check_config`. Data: `db_query`, `db_schema`, `redis_command`,
-`datastore_health`.
+`k8s_status`, `service_config`, `check_config`, `reindex`. Data: `db_query`, `db_schema`, `redis_command`,
+`datastore_health`. Semantic layer: `remember`, `revise`, `retract`, `recall`, `knowledge_gaps`,
+`search_code`. Incidents: `save_incident_report`, `find_incident_reports`.
 **Prompts (agents).** `diagnose`, `triage_logs`, `explain_flow`, `check_misconfiguration`,
-`investigate_datastore`, `write_rca`.
+`investigate_datastore`, `write_rca`, `enrich_knowledge`. `diagnose` starts from past incident reports
+and recalled knowledge, and ends by `remember`ing durable facts.
 
 **Incident report.** `write_rca` fills `services/mcp/templates/incident-report.md` (header, summary,
 impact, timeline, symptoms and how to recognize them, root cause with causal chain and evidence,
@@ -221,7 +247,10 @@ through `redact` before it reaches any sink.
 - `db_query` is read-only at the database: `BEGIN READ ONLY` + `statement_timeout`, user SQL
   wrapped as a subquery (one SELECT only), row cap, always `ROLLBACK`.
 - `redis_command` uses an allow-list of read commands.
-- `graph_query` rejects write clauses (the graph can be rebuilt from source).
+- `graph_query` rejects write clauses. Writes from MCP go only through `remember`/`revise`/`retract`
+  (schema-checked, redacted, audited) and `reindex`.
+- Embedding-provider API keys live only in the Memgraph container's environment (`.env` at
+  `docker compose up`), never in `ops.yaml` or tool arguments.
 - `read_file` / `lsp` paths must fall under configured service, library and contract paths or be
   compose files or Dockerfiles. `.env*`, `.ops/` and `ops.yaml` are always denied.
 - Kubernetes calls are limited to namespaces in `kubernetes.namespaces`.

@@ -2,20 +2,27 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `ops init` writes `ops.yaml`, `.env.example` and `.mcp.json` for a workspace; `ops index` parses Python, Angular (TS/HTML/CSS), Dockerfiles and compose files into a graph and writes it to Memgraph; `ops check` reports missing credentials and unreachable backends.
+**Goal:** `ops init` writes `ops.yaml`, `.env.example` and `.mcp.json` for a workspace. `ops index` parses Python, Angular (TS/HTML/CSS), Dockerfiles, compose files and OpenAPI into a persisted Memgraph graph, **incrementally** (only changed files are re-parsed). It embeds code cards for semantic search, and keeps the LLM-written semantic layer anchored and drift-tracked. `ops watch` keeps the index current. `ops knowledge export/import` backs up the semantic layer. `ops check` reports missing credentials, unreachable backends and the embedding status.
 
-**Architecture:** All logic lives in the `engine` library. `cli` is a thin clap binary. Graph building is a pure function (`graph::build`) that returns nodes and edges, so it is tested without a database. `store` is the only module that talks to Memgraph (rsmgclient, synchronous, wrapped in `spawn_blocking`).
+**Architecture:** All logic lives in the `engine` library. `cli` is a thin clap binary. Graph building is pure:
+- `graph::file_graph` handles one file;
+- `graph::workspace_graph` handles docker, config and contracts;
+- `graph::link` computes cross-file edges from node properties alone.
+
+So it's tested without a database. `store` is the only module that talks to Memgraph (rsmgclient, synchronous, wrapped in `spawn_blocking`). It runs the incremental upsert, relink and reconcile cycle. The structural layer (`layer: "structural"`) is rebuilt from code; the semantic layer (`:Knowledge`) is never deleted by indexing.
 
 **Tech Stack:** Rust 2024, clap 4.6 (derive), config 0.15 (yaml), serde, serde_norway 0.9, serde_json, regex, walkdir, shlex, tree-sitter 0.27 + tree-sitter-python 0.25, tree-sitter-typescript 0.23, tree-sitter-html 0.23, tree-sitter-css 0.25, tree-sitter-yaml 0.7, tree-sitter-json 0.24, tree-sitter-containerfile 0.9, rsmgclient 4.0, tokio, anyhow.
 
-**Spec:** `docs/superpowers/specs/2026-10-24-ops-support-design.md`
+**Spec:** `docs/superpowers/specs/2026-10-24-ops-support-design.md`, plus `docs/superpowers/specs/2026-10-24-persistence-and-semantic-layer-design.md` ("the layer design"; it wins where the two differ)
 
 ## Global Constraints
 - The workspace stays `services/{engine,cli,mcp}`. The `cli` binary is named `ops`, and the `mcp` binary is named `ops-mcp`.
 - Shared crate versions go in root `[workspace.dependencies]`; member crates use `{ workspace = true }`.
 - No `neo4rs`. Grammars are exactly python, typescript, html, css, yaml, json and containerfile (all already in the workspace). No MySQL or SQLite drivers.
 - A secret field is `Secret = Literal(String) | { env: String }`. Secret values never appear in `Debug` output, logs or errors.
-- Node ids are deterministic and unique within a workspace (see Task 6).
+- Node ids are deterministic, unique within a workspace, and **contain no line numbers** (see Task 6), so semantic anchors survive edits.
+- Every structural delete matches `layer: "structural"`. No indexing path deletes or rewrites a `:Knowledge` node. Only the reconcile step (Task 7d) changes its `status` and `ABOUT` edges.
+- Indexing runs under the single-writer lock `.ops/index.lock` (Task 7).
 - Every file skipped on purpose (excluded dir, >1 MiB, `*.min.js`, unparseable) is counted, not fatal.
 - Mark each deliberate shortcut with a `// ponytail:` comment naming its limit and upgrade path.
 - Tests that need Docker/Memgraph are `#[ignore]` and run with `cargo test -- --ignored`.
@@ -27,23 +34,43 @@
 2. **`node_modules`, `.venv`, minified bundles, huge generated files** must not be indexed and must not blow up memory. Test: `build_skips_excluded_and_large` (Task 6).
 3. **Duplicate node ids** from two same-named functions in one file (nested `def`, overloads, `@property` getter and setter) would silently merge nodes. Test: `ids_are_unique` (Task 6).
 4. **Missing env var for a secret**: `ops check` and `Secret::resolve` must name the variable and never print a value. Test: `secret_missing_env_names_var` (Task 1).
-5. **Re-indexing is idempotent**: running `ops index` twice gives the same node and edge counts. Test: `index_twice_same_counts` (Task 7, ignored, needs Memgraph).
+5. **Editing one file and re-indexing** must give exactly the graph a `--full` run would, touch only that file, and leave semantic entries on unchanged code untouched. Tests: `incremental_equals_full` (Task 7), `knowledge_survives_reindex` (Task 7d), both ignored and needing Memgraph.
 
 ---
 
-### Task 0: Project setup (delivered by the setup commit; verify only)
+### Task 0: Project setup (verify) and the Memgraph compose stack
 
-Already in the repo when this plan starts. Don't redo it; only check it.
+The workspace setup below is already in the repo; only check it. The compose changes in Step 3 are new.
 
 - Root `Cargo.toml`: members `services/{engine,cli,mcp}`; `[workspace.package]` (edition 2024, rust-version, `publish = false`); every shared crate version in `[workspace.dependencies]`; workspace lints (`unsafe_code = "forbid"`, clippy `all` warn).
 - Binaries: `cli` → `ops`, `mcp` → `ops-mcp`. `engine` is a library stub that already declares every Part 1 dependency, including the tree-sitter grammars for python, typescript, html, css, yaml, json and containerfile.
 - `deny.toml`: advisories (vulnerable/unmaintained/yanked = deny), license allow-list, bans (wildcards deny, multiple-versions warn), sources (crates.io only).
-- `docker-compose.yml`: memgraph uses named volumes `memgraph_data` and `memgraph_log`; credentials come from `.env`.
+- `docker-compose.yml` (before this task): memgraph on named volumes; credentials from `.env`.
 - `.env.example`, `.gitignore`, `rust-toolchain.toml`, and a `README.md` covering overview, architecture, configuration and setup.
 - CI: `.github/workflows/ci.yml` runs fmt, clippy, test and `cargo deny check`.
 
 - [ ] **Step 1: Verify.** `cargo build --workspace && cargo deny check && docker compose config -q`. Expected: all exit 0.
 - [ ] **Step 2: Branch** for Part 1: `git checkout -b feat/indexer`.
+- [ ] **Step 3: Compose stack** (layer design §1 and §4.5(a)).
+  - **memgraph service:**
+    - Bind mounts `./docker/memgraph/lib:/var/lib/memgraph` and `./docker/memgraph/log:/var/log/memgraph`. Remove the named volumes and the top-level `volumes:`.
+    - `env_file: [{path: .env, required: false}]`, and `HF_HOME=/var/lib/memgraph/hf-cache`.
+    - `command` adds recovery-on-startup, a snapshot interval of 300 s and snapshot-on-exit. Take the exact flag names from `docker run --rm <image> --help`; don't guess them.
+    - Image pinned to a `memgraph/memgraph-mage` tag ≥ 3.6. Use the 3.14.0 tag if it exists on Docker Hub, else the newest 3.x.
+  - **`embeddings-warmup` service** (`profiles: [embeddings]`):
+    - Waits for Bolt, then runs `CALL embeddings.model_info({model_name: $EMBEDDINGS_MODEL}) YIELD info RETURN info;` through `mgconsole`, using the image's own if it has one, else `memgraph/mgconsole`.
+    - Exits non-zero on failure.
+  - **`docker-compose.gpu.yml`:** gives the memgraph service `deploy.resources.reservations.devices: [{driver: nvidia, count: all, capabilities: [gpu]}]`.
+  - **`.env.example`:** add every variable in layer-design table (a), commented, with its default.
+  - **`.gitignore`:** update the `/docker/` comment to "Memgraph bind mount: data, logs, model cache".
+  - **README:** add the Linux `chown` note. Find the uid with `docker run --rm <image> id memgraph`.
+- [ ] **Step 4: Verify.**
+  - Without Docker running: `docker compose config -q`, `docker compose --profile embeddings config -q`, and `docker compose -f docker-compose.yml -f docker-compose.gpu.yml config -q`. All exit 0.
+  - With Docker:
+    1. `docker compose --profile embeddings up -d`. `docker compose logs embeddings-warmup` shows the model info, and the service exits 0.
+    2. `docker compose down && docker compose up -d`. Data created before the restart (`CREATE (:Probe {x:1})`) is still there.
+    3. `docker/memgraph/lib/hf-cache` contains the model.
+- [ ] **Step 5: Commit.** `git commit -am "chore: memgraph bind mount, recovery, embeddings warmup and gpu override"`
 
 ---
 
@@ -61,6 +88,10 @@ Already in the repo when this plan starts. Don't redo it; only check it.
   - `K8sCfg { kubeconfig: Option<String>, context: Option<String>, namespaces: Vec<String> }`
   - `Lib { name, path, language }`
   - `Contract { name, kind: ContractKind /* openapi|library */, path, provider: Option<String>, consumers: Vec<String> }`
+  - `#[serde(untagged)] enum EnvOr<T> { Literal(T), Env { env: String, default: Option<T> } }` and `ctx.setting<T: FromStr + Clone>(&EnvOr<T>) -> Result<T>`: env (process, then `.env`), else `default`, else an error naming the variable.
+  - `SemanticCfg { embeddings: EmbeddingsCfg }`. Every `EmbeddingsCfg` field is an `EnvOr<_>` with the layer design's §4.5(b) defaults: `enabled` (true), `model` ("all-MiniLM-L6-v2"), `device` (null), `batch_size` (2000), `chunk_size` (48), `api_base` (null), `input_type` ("document"), `query_input_type` ("query"), `dimensions` (null), `timeout` (60), `num_retries` (3), `normalize` (true), `remote_batch_size` (null), `concurrency` (4; validate 1–32), `metric` ("cos"), `scalar_kind` ("f32"). `device` is an untagged enum: null, a string, an int, or a list.
+  - `IncidentsCfg { dir: String /* "docs/incidents" */ }`
+  - `Config` gains `semantic: SemanticCfg` and `incidents: IncidentsCfg`, both `#[serde(default)]`.
   - `Service { name, path, language, framework: Framework, uses: Vec<String>, api: Option<Api{prefix: String}>, docker: Option<ServiceDocker{compose_service: Option<String>, dockerfile: Option<String>}>, kubernetes: Option<ServiceK8s{namespace, selector, container: Option<String>}>, logs: Option<LogsCfg>, datastores: Vec<String>, lsp: Option<Vec<String>> }`
   - `enum Framework { Fastapi, Worker, Angular, None }` (serde lowercase)
   - `LogsCfg { source: LogSourceKind /* compose|kubernetes|file|command */, file: Option<String>, command: Option<Vec<String>> }`
@@ -86,6 +117,9 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 #[test] fn secret_missing_env_names_var() { let err = Secret::Env{env:"NOPE_X".into()}.resolve(&ctx_tmp()).unwrap_err().to_string();
   assert!(err.contains("NOPE_X")); }
 #[test] fn secret_debug_hides_literal() { assert!(!format!("{:?}", Secret::Literal("hunter2".into())).contains("hunter2")); }
+#[test] fn semantic_defaults_and_env() { /* ops.yaml without `semantic:` → model "all-MiniLM-L6-v2", concurrency 4, metric "cos";
+  with `model: {env: EMBEDDINGS_MODEL, default: "all-MiniLM-L6-v2"}` and EMBEDDINGS_MODEL=openai/text-embedding-3-small in .env → resolves to the openai model;
+  concurrency 40 → validate reports it; incidents.dir defaults to "docs/incidents" */ }
 #[test] fn ops_env_override() { /* tmp ops.yaml port 7687; with OPS_MEMGRAPH__PORT=7688 set for the test → ctx.config.memgraph.port == 7688 (u16; may need config's try_parsing(true)) */ }
 #[test] fn dotenv_fallback_and_process_env_wins() { /* tmp dir with ops.yaml + .env FOO=a; assert ctx.env("FOO")==Some("a") */ }
 #[test] fn connection_url_injects_password() { /* url "redis://localhost:6379/0", password Literal("p@ss") → "redis://:p%40ss@localhost:6379/0" */ }
@@ -185,7 +219,8 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 - Produces:
   - `discover::discover(root: &Path) -> Result<Config>`
   - `discover::write_files(root: &Path, cfg: &Config, force: bool) -> Result<Vec<PathBuf>>`: writes `ops.yaml` (with a header comment block explaining each field), `.env.example` and `.mcp.json`. Returns the paths it wrote.
-  - `discover::env_names(cfg: &Config) -> Vec<String>` (sorted, deduped)
+  - `discover::env_names(cfg: &Config) -> Vec<String>` (sorted, deduped). Includes `EnvOr` env names (e.g. `EMBEDDINGS_MODEL`) as well as secrets.
+  - `ops init` writes `semantic.embeddings.model: {env: EMBEDDINGS_MODEL, default: all-MiniLM-L6-v2}` and `incidents.dir: docs/incidents` into the generated `ops.yaml`. It never git-ignores `ops-knowledge/`.
 
 - [ ] **Step 1: Failing tests** (`services/engine/tests/discover.rs`; copy the fixture to a tempdir with `std::fs` recursion, no new crate)
 ```rust
@@ -235,7 +270,7 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 - Produces (in `parse/mod.rs`; Task 5 adds to the same types):
   - `enum Lang { Python, TypeScript, JavaScript, Html, Css }` and `Lang::from_path(&Path) -> Option<Lang>` (`.py`, `.ts`, `.js`/`.mjs`/`.cjs`, `.html`, `.css`; `.d.ts`, `*.spec.ts` and `*.min.js` give `None`)
   - `FileFacts { imports: Vec<String>, symbols: Vec<Symbol>, env_reads: Vec<String> /* module level */, template: Option<TemplateFacts>, css_selectors: Vec<String> }`
-  - `Symbol { kind: SymbolKind, name: String, owner: Option<String>, start_line: usize, end_line: usize, signature: String, decorators: Vec<String>, calls: Vec<String>, logs: Vec<LogStmt>, routes: Vec<Route>, http_calls: Vec<HttpCall>, env_reads: Vec<String>, injects: Vec<String>, entrypoint: bool, selector: Option<String>, template_url: Option<String> }`
+  - `Symbol { kind: SymbolKind, name: String, owner: Option<String>, start_line: usize, end_line: usize, signature: String, decorators: Vec<String>, calls: Vec<String>, logs: Vec<LogStmt>, routes: Vec<Route>, http_calls: Vec<HttpCall>, env_reads: Vec<String>, injects: Vec<String>, entrypoint: bool, selector: Option<String>, template_url: Option<String>, qualname: String /* Owner.name or outer.inner */, doc: Option<String> /* docstring / JSDoc, ≤ 1 KiB */, body_hash: String /* sha256 hex of the symbol's non-comment tokens joined by one space */ }`
   - `enum SymbolKind { Function, Method, Class, Component, Injectable, Schema }`. `Schema` = pydantic `BaseModel` subclass, TS `interface`, or exported TS `type` alias.
   - `Symbol.uses_types: Vec<String>`: the type names in parameter and return annotations (generics unwrapped: `list[PayRequest]` → `PayRequest`; builtins dropped).
   - `LogStmt { level: String /* trace|debug|info|warn|error */, template: String, line: usize }`
@@ -263,11 +298,16 @@ Already in the repo when this plan starts. Don't redo it; only check it.
   assert!(template_regex("{}").is_none()); }
 #[test] fn pydantic_schema_and_annotations() { let f = parse_file(Lang::Python, MODELS_PY); assert_eq!(sym(&f, "PayRequest").kind, SymbolKind::Schema);
   let f = parse_file(Lang::Python, MAIN_PY); assert_eq!(sym(&f, "pay").uses_types, ["PayRequest"]); }
+#[test] fn body_hash_ignores_formatting_and_comments() { let a = sym(&parse_file(Lang::Python, "def f(x):\n    return x + 1\n"), "f").body_hash.clone();
+  let b = sym(&parse_file(Lang::Python, "def f(x):  # c\n\n    return   x + 1\n"), "f").body_hash.clone();
+  let c = sym(&parse_file(Lang::Python, "def f(x):\n    return x + 2\n"), "f").body_hash.clone(); assert_eq!(a, b); assert_ne!(a, c); }
+#[test] fn docstring_and_qualname() { let f = parse_file(Lang::Python, "class A:\n    def m(self):\n        \"\"\"Charge the card.\"\"\"\n        def inner(): pass\n");
+  assert_eq!(sym(&f, "m").qualname, "A.m"); assert_eq!(sym(&f, "m").doc.as_deref(), Some("Charge the card.")); assert_eq!(sym(&f, "inner").qualname, "A.m.inner"); }
 #[test] fn nested_and_duplicate_defs() { // def a(): def inner(): ...; and two `def prop` under @property/@prop.setter → 3 symbols, distinct start_line
 }
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine parse::python`. Expected: FAIL.
-- [ ] **Step 3: Implement `python::extract(src) -> FileFacts`** with a recursive walk over the tree-sitter tree.
+- [ ] **Step 3: Implement `python::extract(src) -> FileFacts`** with a recursive walk over the tree-sitter tree. Add `sha2` to `[workspace.dependencies]` and engine, then run `cargo deny check`. `body_hash`: walk the symbol's leaf nodes, skip `comment`, join their text with one space, then sha256.
   - **Functions and methods:** `function_definition`. `owner` is the enclosing `class_definition`. Decorators come from the parent `decorated_definition`.
   - **Calls:** `call` → last segment of the `function` field. Arguments of `Depends(x)` / `Security(x)` count as calls to `x`.
   - **Logs:** callee is one of `debug info warning warn error exception critical` on a receiver named `log|logger|logging|_log|_logger|structlog` or one ending in `logger`, or loguru's `logger.*`. Take the first string arg. f-strings keep `{expr}` verbatim. Levels: `exception|critical` → `error`, `warning` → `warn`.
@@ -308,6 +348,7 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 #[test] fn css_selectors() { assert_eq!(parse_file(Lang::Css, ".pay { color: red } #x .y:hover {}").css_selectors, [".pay", "#x .y:hover"]); }
 #[test] fn ts_interfaces_are_schemas() { let f = parse_file(Lang::TypeScript, "export interface PayRequest { amount: number }\nexport type Id = string;\nclass S { pay(b: PayRequest): Observable<Order> {} }");
   assert_eq!(sym(&f, "PayRequest").kind, SymbolKind::Schema); assert_eq!(sym(&f, "pay").uses_types, ["PayRequest", "Order"]); }
+#[test] fn ts_jsdoc_and_hash() { /* `/** Pays the order. */ pay(id) {...}` → doc "Pays the order."; reformatting the body keeps body_hash */ }
 #[test] fn ts_env_reads() { /* environment.apiUrl → env_reads ["environment.apiUrl"]; process.env.FOO → ["FOO"] */ }
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine parse::`. Expected: FAIL for the new tests.
@@ -363,7 +404,13 @@ Already in the repo when this plan starts. Don't redo it; only check it.
   - `Node { label: &'static str, id: String, props: serde_json::Map<String, Value> }`
   - `Edge { rel: &'static str, from: String, from_label: &'static str, to: String, to_label: &'static str, props: serde_json::Map<String, Value> }`. Task 7 groups edges by `(rel, from_label, to_label)` for its `MATCH`.
   - `Stats { files_indexed: usize, files_skipped: usize, unresolved_calls: usize }`
-  - `graph::build(ctx: &Ctx) -> Result<Graph>`
+  - `graph::FileGraph { nodes: Vec<Node>, edges: Vec<Edge> }`. Edges are file-local only: `CONTAINS DEFINES HAS_METHOD LOGS READS_ENV HANDLED_BY`.
+  - `graph::file_graph(ctx: &Ctx, unit: &str /* service or lib name */, relpath: &str, src: &str) -> Option<FileGraph>`: `None` when the file is skipped.
+  - `graph::workspace_graph(ctx: &Ctx) -> Result<Graph>`: Service/Datastore/EnvVar/Contract/Endpoint/Schema-from-OpenAPI nodes, plus docker edges (DEPENDS_ON CONNECTS_TO SHARES_VOLUME SETS_ENV USES_DATASTORE PROVIDES DECLARES DEFINES_SCHEMA). No per-file parsing.
+  - `graph::LINK_RELS: &[&str] = &["CALLS","CALLS_API","USES_SCHEMA","IMPLEMENTED_BY","INJECTS","TEMPLATE_BINDS","USES_LIB","CONSUMES","BOUNDARY"]`
+  - `graph::link(ctx: &Ctx, nodes: &[Node]) -> (Vec<Edge>, usize /* unresolved calls */)`: computes every LINK_RELS edge from **node properties only**: `calls`, `http_calls`, `uses_types`, `injects`, `template_url`, `imports` (on File), `routes`, `qualname`, `unit`. It never reads files.
+  - `graph::build(ctx: &Ctx) -> Result<Graph>`: `workspace_graph` + every `file_graph` + `link`. Used by `--dry-run`, by `--full` and by tests.
+  - `graph::card(node: &Node) -> Option<String>`: the code-card text for Function/Class/Component/Injectable/Schema/Route: kind, qualname, signature, doc, decorators/route, log templates, file path, joined by newlines and capped at 2 KiB. `None` for other labels.
   - Labels and rels are exactly those in the spec's graph model. In full:
     - Labels: `Service Datastore File Function Class Component Injectable Schema LogStatement Route EnvVar Contract Endpoint`.
     - Rels: `DEPENDS_ON CONNECTS_TO SHARES_VOLUME USES_LIB USES_DATASTORE CONTAINS DEFINES HAS_METHOD CALLS LOGS HANDLED_BY CALLS_API INJECTS TEMPLATE_BINDS READS_ENV SETS_ENV PROVIDES CONSUMES DECLARES IMPLEMENTED_BY DEFINES_SCHEMA USES_SCHEMA BOUNDARY`.
@@ -371,10 +418,11 @@ Already in the repo when this plan starts. Don't redo it; only check it.
   - **Node ids:**
     - `svc:{name}`, `ds:{name}`, `env:{NAME}`
     - `file:{svc}:{relpath}`
-    - `sym:{svc}:{relpath}:{owner.}{name}:{start_line}`
-    - `log:{sym_id}:{line}`
+    - `sym:{svc}:{relpath}:{qualname}`, plus `~2`, `~3`, … for repeats of the same qualname in one file, in source order. No line numbers.
+    - `log:{sym_id}:{n}`, where `n` is the statement's order within the function.
     - `route:{svc}:{METHOD}:{path}`
   - More node ids: `contract:{name}`, `endpoint:{contract}:{METHOD}:{path}`, `schema:{contract}:{name}`.
+  - Every structural node has `layer: "structural"`. File nodes carry `hash` (sha256 of the content), `size` and `imports`. Symbol nodes carry `qualname`, `body_hash`, `start_line`, `end_line`, `doc`, `card`, and the link facts listed under `link`.
   - `LogStatement.props` holds `regex` (from `template_regex`), `service` and `file`, so Part 2 can match without joins.
 
 - [ ] **Step 1: Failing tests** (against the Task 3 fixture with its generated config)
@@ -400,6 +448,11 @@ Already in the repo when this plan starts. Don't redo it; only check it.
   assert!(has_edge(&g, "USES_SCHEMA", &id_of(&g, "Function", "pay"), &schema_id(&g, "PayRequest", "common")));
   let b = edge(&g, "BOUNDARY", "svc:frontend", "svc:orders").unwrap(); assert!(via(b).contains(&"http") && via(b).contains(&"contract"));
   let b = edge(&g, "BOUNDARY", "svc:orders", "svc:worker").unwrap(); assert!(via(b).contains(&"compose") && via(b).contains(&"shared_lib")); }
+#[test] fn ids_have_no_lines() { let g = build(&ctx()).unwrap(); assert!(g.nodes.iter().filter(|n| n.id.starts_with("sym:")).all(|n| !n.id.rsplit(':').next().unwrap().chars().all(|c| c.is_ascii_digit()))); }
+#[test] fn link_from_props_matches_build() { let g = build(&ctx()).unwrap(); let (mut l, _) = link(&ctx(), &g.nodes);
+  let mut b: Vec<_> = g.edges.iter().filter(|e| LINK_RELS.contains(&e.rel)).cloned().collect(); l.sort_by(|a,b| key(a).cmp(&key(b))); b.sort_by(|a,b| key(a).cmp(&key(b))); assert_eq!(keys(&l), keys(&b)); }
+#[test] fn card_contents() { let g = build(&ctx()).unwrap(); let c = card(node(&g, &id_of(&g, "Function", "pay"))).unwrap();
+  assert!(c.contains("POST /api/orders/{order_id}/pay") && c.contains("payment failed for order %s") && c.contains("app/main.py")); }
 #[test] fn ids_are_unique() { let g = build(&ctx()).unwrap(); let mut ids: Vec<_> = g.nodes.iter().map(|n| &n.id).collect(); let n = ids.len(); ids.sort(); ids.dedup(); assert_eq!(ids.len(), n); }
 #[test] fn build_skips_excluded_and_large() { /* add a 2 MiB .py and a foo.min.js to the tmp fixture; node_modules/x/index.js exists */
   let g = build(&ctx()).unwrap(); assert!(g.nodes.iter().all(|n| !n.id.contains("node_modules") && !n.id.contains("min.js") && !n.id.contains("big.py"))); assert!(g.stats.files_skipped >= 2); }
@@ -432,54 +485,204 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 
 ---
 
-### Task 7: Memgraph store, `ops index`, `ops check`
+### Task 7: Memgraph store with incremental indexing, `ops index`, `ops check`
 
 **Files:**
-- Create: `services/engine/src/store.rs`
+- Create: `services/engine/src/store.rs`, `services/engine/src/lock.rs`
 - Modify: `services/cli/src/main.rs`
 
 **Interfaces:**
-- Consumes: `Ctx`, `graph::Graph`
-- Produces (Part 2 depends on these):
-  - `store::write(ctx: &Ctx, g: &Graph) -> Result<()>`: synchronous.
-    - First, in **autocommit mode, outside the write transaction**: `CREATE INDEX ON :<Label>(id)` for every label used, and `:<Label>(workspace)`. Memgraph rejects index changes inside a multi-statement transaction ("Index manipulation not allowed in multicommand transactions"); confirm against the Memgraph docs while doing Step 1. Ignore errors that only say the index already exists.
-    - Then, in one transaction: `MATCH (n {workspace:$ws}) DETACH DELETE n`.
-    - Then nodes per label in batches of 500: `UNWIND $rows AS r CREATE (n:<Label>) SET n = r`.
-    - Then edges per `(rel, from_label, to_label)`: `UNWIND $rows AS r MATCH (a:<From> {id:r.from}), (b:<To> {id:r.to}) CREATE (a)-[e:<REL>]->(b) SET e = r.props`.
-    - Commits once at the end.
-  - `store::query(ctx: &Ctx, cypher: &str, params: serde_json::Map<String, Value>) -> Result<Vec<serde_json::Map<String, Value>>>`: synchronous; one map per record, keyed by column. Node → `{"_labels": [...], ...props}`, Relationship → `{"_type": ..., ...props}`, Path → `{"nodes": [...], "rels": [...]}`.
-  - `store::query_async(ctx: Ctx, cypher: String, params) -> Result<…>`: `tokio::task::spawn_blocking` around `query`. The connection is created inside the closure because rsmgclient's `Connection` is not `Send`.
-  - `store::ping(ctx: &Ctx) -> Result<()>`
+- Consumes: `Ctx`, `graph::{file_graph, workspace_graph, link, LINK_RELS, Graph, Node, Edge}`
+- Produces (Tasks 7b–7d and Part 2 depend on these):
+  - Low level:
+    - `store::query(ctx: &Ctx, cypher: &str, params: serde_json::Map<String, Value>) -> Result<Vec<serde_json::Map<String, Value>>>`: synchronous; one map per record, keyed by column. Node → `{"_labels": [...], ...props}` (with `embedding` removed), Relationship → `{"_type": ..., ...props}`, Path → `{"nodes": [...], "rels": [...]}`.
+    - `store::query_async(ctx: Ctx, cypher: String, params) -> Result<…>`: `spawn_blocking` around `query`, connecting inside the closure (rsmgclient's `Connection` is not `Send`).
+    - `store::ping(ctx: &Ctx) -> Result<()>`
+    - `store::ensure_indexes(ctx: &Ctx, labels: &[&str]) -> Result<()>`: **autocommit**, outside any transaction. Creates `:<Label>(id)` and `:<Label>(workspace)`. Memgraph rejects index changes inside multi-statement transactions; confirm in its docs. "Already exists" errors are ignored.
+  - `lock::IndexLock::acquire(ctx: &Ctx, wait: Duration) -> Result<IndexLock>`: takes `.ops/index.lock`, holding `{pid, started_at}`. A lock whose pid is dead is taken over. Returns `Err("index in progress (pid N, since T)")` once `wait` runs out. The lock is released on drop.
+  - `enum IndexMode { Incremental, Full }`
+  - `store::IndexReport { mode, added, changed, deleted, unchanged, nodes, edges, unresolved_calls, fingerprint_changed: bool, vanished: Vec<VanishedAnchor>, run_id: String }`
+  - `store::VanishedAnchor { knowledge_id: String, rel: String /* ABOUT|STEP|FROM|TO */, anchor_key: String, anchor_hash: String, qualname: Option<String>, unit: Option<String> }`
+  - `store::index(ctx: &Ctx, mode: IndexMode, wait: Duration) -> Result<IndexReport>`. The algorithm is the layer design's §3:
+    1. **Lock.** Take the lock, then run `ensure_indexes`.
+    2. **Fingerprint.** `fingerprint = sha256(ops version + canonical JSON of config.services, shared_libs, contracts, exclude, docker)`. If it differs from the latest `IndexRun.fingerprint`, mode becomes Full. (Task 7c adds the embedding fields to the fingerprint.)
+    3. **Plan.** Walk the files, then `MATCH (f:File {workspace:$ws, layer:'structural'}) RETURN f.path, f.hash`, and diff the two.
+    4. **One transaction:**
+       - a. For each added or changed file: `file_graph`, then `UNWIND … MERGE (n:<Label> {id:r.id}) SET n = r` per label.
+         - Delete that file's old local edges (`CONTAINS DEFINES HAS_METHOD LOGS READS_ENV HANDLED_BY`) and create the new ones.
+         - Collect the ids the file produced before but no longer does.
+       - b. Deleted files: all their node ids.
+       - c. Workspace graph: MERGE its nodes. Delete structural nodes of labels Service/Datastore/EnvVar/Contract/Endpoint/Schema(openapi) that it no longer produces. Replace its edges.
+       - d. **Before deleting** the vanished ids: `MATCH (k:Knowledge)-[r]->(n) WHERE n.id IN $vanished` → `VanishedAnchor`s. Then `DETACH DELETE` those nodes, matching `layer:'structural'`.
+       - e. Relink: delete every edge whose type is in LINK_RELS within the workspace. Load all symbol, route and file nodes (props only), run `graph::link`, and create the result.
+       - f. Write `(:IndexRun {id, started_at, finished_at, mode, files_added, files_changed, files_deleted, fingerprint, git_head, workspace, layer:'structural'})`. Keep the newest 20.
+    5. **Commit.** On any error, roll back. The previous graph stays intact.
+
+    Full mode is the same steps with every file treated as changed, plus: structural nodes not produced by this run are deleted (through step d). The structural layer is never wiped wholesale.
+  - `IndexReport` is also what Task 7d's reconcile consumes (`vanished`, `run_id`).
 
 - [ ] **Step 1: Read the rsmgclient 4.0 API before coding.** Look in `~/.cargo/registry/src/*/rsmgclient-4.0.0/src/` and confirm:
-  - `ConnectParams` fields (host, port, username, password, autocommit)
-  - `Connection::connect`, `execute(query, Option<&HashMap<String, QueryParam>>)`, `fetchall`, `commit`
+  - `ConnectParams` (host, port, username, password, autocommit)
+  - `Connection::connect`, `execute`, `fetchall`, `commit`, `rollback`
   - the `QueryParam` and `Value` variants
 
   Write the JSON ↔ `QueryParam`/`Value` converters to match what you find.
 - [ ] **Step 2: Failing tests**
 ```rust
-#[test] fn json_param_round_trip() { /* json!({"a":[1,"x",{"b":true}],"n":null}) → QueryParam::Map(...) with nested List/Map/Null (pure, no DB) */ }
-#[test] #[ignore] fn index_twice_same_counts() { let ctx = fixture_ctx(); let g = graph::build(&ctx).unwrap();
-  store::write(&ctx, &g).unwrap(); store::write(&ctx, &g).unwrap();
-  let n = store::query(&ctx, "MATCH (n {workspace:$ws}) RETURN count(n) AS c", ws(&ctx)).unwrap()[0]["c"].as_u64().unwrap();
-  assert_eq!(n as usize, g.nodes.len());
-  let e = store::query(&ctx, "MATCH (a {workspace:$ws})-[r]->() RETURN count(r) AS c", ws(&ctx)).unwrap()[0]["c"].as_u64().unwrap();
-  assert_eq!(e as usize, g.edges.len()); }
+#[test] fn json_param_round_trip() { /* json!({"a":[1,"x",{"b":true}],"n":null}) → QueryParam::Map(...) with nested List/Map/Null (pure) */ }
+#[test] fn lock_blocks_second_indexer() { /* acquire on tmp ctx; second acquire with wait 0 → Err containing "index in progress"; drop first → second succeeds; stale lock with dead pid is taken over */ }
+#[test] #[ignore] fn index_twice_same_counts() { let ctx = tmp_fixture_ctx(); let a = store::index(&ctx, IndexMode::Full, Duration::ZERO).unwrap();
+  let b = store::index(&ctx, IndexMode::Incremental, Duration::ZERO).unwrap(); assert_eq!((b.added, b.changed, b.deleted), (0, 0, 0)); assert_eq!((a.nodes, a.edges), (b.nodes, b.edges)); }
+#[test] #[ignore] fn incremental_equals_full() { let ctx = tmp_fixture_ctx(); store::index(&ctx, IndexMode::Full, Duration::ZERO).unwrap();
+  edit(&ctx, "services/orders/app/main.py", |s| s.replace("def charge(", "def charge_card(").replace("charge(order_id)", "charge_card(order_id)"));
+  let r = store::index(&ctx, IndexMode::Incremental, Duration::ZERO).unwrap(); assert_eq!(r.changed, 1);
+  let inc = dump(&ctx); store::index(&ctx, IndexMode::Full, Duration::ZERO).unwrap(); assert_eq!(inc, dump(&ctx)); } // dump = sorted node ids+props and edge keys, excluding IndexRun
+#[test] #[ignore] fn deleted_file_removed() { /* delete services/worker/worker.py → its Function nodes and CALLS edges are gone; r.deleted == 1 */ }
+#[test] #[ignore] fn fingerprint_forces_reparse() { /* change a service's framework in ops.yaml → next incremental run reports fingerprint_changed and changed == every file */ }
+#[test] #[ignore] fn failed_run_keeps_previous_graph() { /* inject a failure after step 4a (test hook) → node count equals the count before the run */ }
 ```
-- [ ] **Step 3: Run.** `cargo test -p engine store`. Expected: FAIL (compile).
-- [ ] **Step 4: Implement `store`.**
+- [ ] **Step 3: Run.** `cargo test -p engine store lock`. Expected: FAIL (compile).
+- [ ] **Step 4: Implement** `store`, `lock`.
   - Credentials come from `memgraph.username`/`password` through `Secret::resolve`; when unset, connect without auth.
   - Error format is exactly `memgraph <host>:<port>: <redacted cause>`, never the password. Part 2's smoke test matches on the `memgraph ` prefix.
+  - Batches of 500 rows per `UNWIND`.
+  - `// ponytail: relink recomputes all link edges each run; scope it to the affected units if relink time shows up in profiles.`
 - [ ] **Step 5: CLI commands.**
-  - `ops index [--root] [--dry-run]`: build, then either print `Stats` plus node counts by label (`--dry-run`) or `store::write` and print the same counts.
+  - `ops index [--root] [--full] [--dry-run] [--wait SECS]`:
+    - `--dry-run` runs `graph::build` and prints `Stats` and per-label counts, without touching Memgraph.
+    - Otherwise it runs `store::index` and prints the `IndexReport` as one line plus per-label counts.
   - `ops check [--root]`:
-    1. Print `config::validate` problems.
-    2. Print every secret that doesn't resolve, by env name.
-    3. Print `store::ping`.
-    4. Print `kubectl --context <ctx> version --client=false` when kubernetes is configured.
-    5. Exit 1 if anything failed.
+    1. `config::validate` problems.
+    2. Every secret or `EnvOr` that doesn't resolve, named by its env var.
+    3. `store::ping`.
+    4. The last `IndexRun` time and the number of files changed since.
+    5. `kubectl --context <ctx> version --client=false` when kubernetes is configured.
+    6. Exit 1 if anything failed.
 
-    (Task 12 adds datastore pings to this list.)
-- [ ] **Step 6: Run.** `cargo test -p engine` (PASS). `cargo run -p cli -- index --dry-run --root services/engine/tests/fixtures/shop` (prints counts). With Docker up: `docker compose up -d memgraph`, `MEMGRAPH_USER=ops MEMGRAPH_PASSWORD=ops cargo test -p engine -- --ignored` (PASS). `docker compose down && docker compose up -d memgraph`, and the node count is unchanged (persistence check). If the count is 0 after restart, recovery-on-startup is off. Find the exact flag with `docker run --rm memgraph/memgraph-mage --help | grep -i recover`, add it to the compose `command`, and re-run this check.
-- [ ] **Step 7: Commit.** `git commit -am "feat: memgraph store, ops index, ops check"`
+    (Task 7c adds the embedding status; Task 12 adds datastore pings.)
+- [ ] **Step 6: Run.** `cargo test -p engine` (PASS). `cargo run -p cli -- index --dry-run --root services/engine/tests/fixtures/shop` (prints counts). With Docker up: `cargo test -p engine -- --ignored` (PASS).
+- [ ] **Step 7: Commit.** `git commit -am "feat: incremental memgraph store, ops index, ops check"`
+
+---
+
+### Task 7b: `ops watch`
+
+**Files:**
+- Create: `services/engine/src/watch.rs`
+- Modify: `services/cli/src/main.rs`, root `Cargo.toml` (add `notify`)
+
+**Interfaces:**
+- Consumes: `store::index`, `lock::IndexLock`, `config` `exclude`
+- Produces:
+  - `watch::Debouncer::new(window: Duration)`, with `push(path: PathBuf, at: Instant)` and `ready(now: Instant) -> Option<Vec<PathBuf>>`. It's pure: a batch is ready once `window` has passed with no new event.
+  - `watch::run(ctx: &Ctx, debounce: Duration) -> Result<()>`: `notify` recursive watcher on the workspace root. It ignores excluded dirs, `.ops/`, `docker/` and `ops-knowledge/`. On each ready batch it calls `store::index(Incremental, wait = 30s)` and logs one summary line (`+a ~c -d in Nms`). A lock timeout is logged and the batch is retried on the next event.
+  - CLI: `ops watch [--root] [--debounce-ms 1500]`.
+
+- [ ] **Step 1: Failing tests**
+```rust
+#[test] fn debounce_batches() { let mut d = Debouncer::new(ms(1500)); d.push("a".into(), t(0)); d.push("b".into(), t(1000));
+  assert!(d.ready(t(2000)).is_none()); assert_eq!(d.ready(t(2600)).unwrap(), ["a","b"]); assert!(d.ready(t(5000)).is_none()); }
+#[test] fn ignores_excluded() { /* is_watched(ctx, "frontend/node_modules/x.js") == false; is_watched(ctx, "ops-knowledge/k.json") == false; "services/orders/app/main.py" == true */ }
+```
+- [ ] **Step 2: Run.** `cargo test -p engine watch`. Expected: FAIL.
+- [ ] **Step 3: Implement.** Add `notify` (latest 8.x) to the workspace and run `cargo deny check`.
+- [ ] **Step 4: Run.** Tests PASS. Manual check with Docker: `ops watch --root <tmp fixture>`, edit `main.py`, and a `~1` summary line appears within 2 s.
+- [ ] **Step 5: Commit.** `git commit -am "feat: ops watch"`
+
+---
+
+### Task 7c: Embeddings, vector and text indexes
+
+**Files:**
+- Create: `services/engine/src/embed.rs`
+- Modify: `services/engine/src/store.rs` (embedding step + fingerprint), `services/cli/src/main.rs` (`ops check` status)
+
+**Interfaces:**
+- Consumes: `store::{query, ensure_indexes}`, `EmbeddingsCfg`, `graph::card`
+- Produces:
+  - `embed::config_map(ctx: &Ctx, input_type: InputKind /* Document | Query */) -> Result<serde_json::Map>`: the module's configuration map.
+    - `model` → `model_name`. `query_input_type` is used when `Query`, sent as `input_type`.
+    - Null fields are omitted. `metric`, `scalar_kind`, `enabled` and `query_input_type` are never sent.
+  - `embed::ModelInfo { dimension: usize, remote_provider: Option<String> }`, and `embed::model_info(ctx) -> Result<ModelInfo>` via `CALL embeddings.model_info($cfg)`.
+  - `enum EmbedStatus { Vector(ModelInfo), TextOnly(String /* reason */) }`, and `embed::status(ctx) -> EmbedStatus`. Gives `TextOnly` when `enabled` is false, the `embeddings` module is absent (`CALL mg.procedures()` has no `embeddings.text`), or `model_info` fails.
+  - `embed::embed_texts(ctx, texts: &[String], kind: InputKind) -> Result<Vec<Vec<f32>>>` via `CALL embeddings.text($texts, $cfg)`, in chunks of 256.
+  - `embed::ensure_search_indexes(ctx, info: Option<&ModelInfo>, rebuild_vectors: bool) -> Result<()>`. Autocommit.
+    - Text indexes: `knowledge_text ON :Knowledge`, and `code_text` on each code label (one index per label if `CREATE TEXT INDEX` takes one label).
+    - Vector indexes, when `info` is Some: `knowledge_vec ON :Knowledge(embedding)` and `code_vec ON :Function|Class|Component|Injectable|Schema|Route(embedding)`, with `{dimension, capacity: max(1024, 2 × count), metric, scalar_kind}`.
+    - `rebuild_vectors` drops them first.
+  - **In `store::index`**, after relink and outside the main transaction (vector indexes are READ_UNCOMMITTED):
+    - **Fingerprint:** also includes `model`, `dimensions`, `metric` and `scalar_kind`. A change sets `rebuild_vectors` and re-embeds everything, including `:Knowledge`.
+    - **Re-embed only what changed:** nodes whose `card` changed (compare against a stored `card_hash`), plus every node when `rebuild_vectors` is set. `SET n.embedding = $vec, n.card_hash = $h`.
+    - **`--full`** always sets `rebuild_vectors`, because deleted nodes don't free vector-index memory until the index is dropped.
+    - **`TextOnly`:** skip embedding, and record the reason in `IndexReport.embedding: String`.
+  - `ops check` prints `embeddings: vector (local all-MiniLM-L6-v2, dim 384)`, or `remote openai, dim 1536`, or `text-only: <reason>`. It also warns when `SHOW VECTOR INDEX INFO` reports more than 2× as many vectors as live nodes.
+
+- [ ] **Step 1: Failing tests**
+```rust
+#[test] fn config_map_mapping() { let m = config_map(&ctx_with(r#"semantic: {embeddings: {model: "voyage/voyage-3", dimensions: 512}}"#), InputKind::Query).unwrap();
+  assert_eq!(m["model_name"], "voyage/voyage-3"); assert_eq!(m["input_type"], "query"); assert_eq!(m["dimensions"], 512); assert!(!m.contains_key("metric") && !m.contains_key("api_base")); }
+#[test] fn disabled_is_text_only() { assert!(matches!(status(&ctx_with("semantic: {embeddings: {enabled: false}}")), EmbedStatus::TextOnly(_))); }
+#[test] #[ignore] fn embeds_cards_default_model() { /* MAGE image: index fixture → every Function has `embedding` of length 384; second incremental run re-embeds 0; editing pay's docstring re-embeds exactly 1 */ }
+#[test] #[ignore] fn model_change_rebuilds() { /* change model to another local model with a different dim → fingerprint_changed, vector index recreated with the new dimension */ }
+```
+- [ ] **Step 2: Run.** `cargo test -p engine embed`. Expected: FAIL.
+- [ ] **Step 3: Implement.** Before coding, confirm the procedure signatures with `CALL mg.procedures() YIELD name, signature WHERE name STARTS WITH 'embeddings' OR name STARTS WITH 'vector_search' OR name STARTS WITH 'text_search' RETURN *`.
+- [ ] **Step 4: Run.** Unit tests PASS. With `docker compose --profile embeddings up -d`, the `--ignored` tests PASS.
+- [ ] **Step 5: Commit.** `git commit -am "feat: code-card embeddings and search indexes"`
+
+---
+
+### Task 7d: Semantic-layer core, drift reconciliation, export and import
+
+**Files:**
+- Create: `services/engine/src/semantic.rs`
+- Modify: `services/engine/src/store.rs` (call `reconcile` at the end of `index`), `services/cli/src/main.rs` (`ops knowledge`), root `Cargo.toml` (add `uuid` with `v4`)
+
+**Interfaces:**
+- Consumes: `store::{query, IndexReport, VanishedAnchor}`, `embed::embed_texts`, `redact`
+- Produces (Part 2 Task 8b wraps these as MCP tools):
+  - `semantic::Kind { Summary, Concept, Flow, Relation, Invariant, Gotcha, OpsNote }` (serde snake_case), `Confidence { High, Medium, Low }`, `Status { Current, Stale, Orphaned, Retracted }`
+  - `semantic::Entry { id, kind, title, body, confidence, status, evidence: Vec<String>, tags: Vec<String>, author_client: String, author_model: Option<String>, session_id: String, created_at, updated_at, anchors: Vec<Anchor>, steps: Vec<Anchor> /* flow */, from: Vec<Anchor>, to: Vec<Anchor> /* relation */, orphaned_anchors: Vec<String>, stale_since: Option<String> }`
+  - `semantic::Anchor { node_id: String, anchor_key: String /* = node_id */, anchor_hash: String }`
+  - `semantic::anchor_hash(node: &serde_json::Map) -> String`: the layer design's §4.3 table. Function/Class/Component/Injectable/Schema → `body_hash`; File → `hash`; Route → its handler's `body_hash`; Contract → its document hash; everything else → `""` (never stale).
+  - `semantic::NewEntry { kind, title, body, confidence, evidence, tags, anchors: Vec<String> /* ids */, steps, from, to, author_client, author_model, session_id }`, and `semantic::create(ctx, NewEntry) -> Result<String /* "k:" + uuid v4 */>`.
+    - Validates: title ≤ 120 chars, body ≤ 8 KiB, evidence ≤ 20 items, at least one anchor (flow: ≥ 2 steps; relation: from and to).
+    - Redacts `title`, `body` and `evidence`.
+    - Writes `:Knowledge {…, workspace, layer:'semantic'}` plus `ABOUT/STEP{order}/FROM/TO {anchor_key, anchor_hash}` edges, then embeds `title + body + tags` when `embed::status` is `Vector`.
+    - Retries up to 3 times on a Memgraph transaction conflict (match the error text from Memgraph's docs).
+  - `semantic::get(ctx, id) -> Result<Entry>`, and `semantic::about(ctx, node_ids: &[String], include_stale: bool) -> Result<Vec<Entry>>`: entries anchored (`ABOUT`/`STEP`/`FROM`/`TO`) to any of the nodes, excluding `retracted`.
+  - `semantic::revise(ctx, id, patch: Patch) -> Result<String>`: a new entry that `SUPERSEDES` the old one; the old one gets `status: retracted`.
+  - `semantic::retract(ctx, id, reason) -> Result<()>`: sets `status: retracted` and appends the reason. It never deletes.
+  - `semantic::reconcile(ctx, report: &IndexReport) -> Result<ReconcileReport { stale: usize, orphaned: usize, reattached: usize }>`. Implements the layer design's §4.3:
+    - **Surviving anchors:** recompute `anchor_hash`. If it differs: `status: stale`, `stale_since: run_id`.
+    - **`report.vanished`:** if exactly one symbol in the same `unit` has the same `qualname`, re-create the edge to it and mark the entry stale. Otherwise add the `anchor_key` to `orphaned_anchors`; once the entry has no live anchors, set `status: orphaned`.
+    - `retracted` entries are skipped.
+  - `semantic::export(ctx, dir: &Path) -> Result<usize>`: writes `<dir>/knowledge.jsonl`, one entry per line.
+    - Sorted by id. Keys within each object are sorted. Anchors are given by `anchor_key`, never by internal ids or vectors.
+    - Ends with a trailing newline.
+  - `semantic::import(ctx, dir: &Path) -> Result<ImportReport { created, updated, skipped }>`: merges by id, and the newer `updated_at` wins.
+    - Errors if the workspace has no `IndexRun` ("run `ops index` first").
+    - Then runs `reconcile` and re-embeds what it imported.
+  - CLI:
+    - `ops knowledge export [--root] [--out ops-knowledge/]`
+    - `ops knowledge import [--root] [--from ops-knowledge/]`
+    - `ops check` warns when the newest `Knowledge.updated_at` is later than the export file's mtime.
+    - `ops init` must not add `ops-knowledge/` to `.gitignore`.
+
+- [ ] **Step 1: Failing tests**
+```rust
+#[test] fn create_validates() { /* body 9 KiB → Err; no anchors → Err; flow with 1 step → Err (pure validation fn `NewEntry::validate`) */ }
+#[test] fn export_is_deterministic() { /* two exports of the same entries in a different insertion order are byte-identical; no "embedding" key appears */ }
+#[test] #[ignore] fn knowledge_survives_reindex() { let ctx = tmp_fixture_ctx(); store::index(&ctx, IndexMode::Full, Duration::ZERO).unwrap();
+  let k = semantic::create(&ctx, summary_about("pay")).unwrap(); edit(&ctx, "services/worker/worker.py", |s| s + "\n# touch\n");
+  store::index(&ctx, IndexMode::Incremental, Duration::ZERO).unwrap(); store::index(&ctx, IndexMode::Full, Duration::ZERO).unwrap();
+  let e = semantic::get(&ctx, &k).unwrap(); assert_eq!(e.status, Status::Current); assert_eq!(e.anchors.len(), 1); }
+#[test] #[ignore] fn stale_on_body_change() { /* summary about pay; edit pay's body; incremental index → status Stale, stale_since == report.run_id; whitespace-only edit → still Current */ }
+#[test] #[ignore] fn reattach_on_move_and_orphan_on_delete() { /* move `charge` to services/orders/app/billing.py → entry re-anchored to the new id, Stale; delete charge entirely → Orphaned with orphaned_anchors == [old id] */ }
+#[test] #[ignore] fn secret_redacted_on_write() { /* body "token=abc123" → stored body contains "token=***" */ }
+#[test] #[ignore] fn import_after_index() { /* export → wipe Memgraph → import before index → Err "run `ops index` first"; index then import → entries Current, anchors attached */ }
+```
+- [ ] **Step 2: Run.** `cargo test -p engine semantic`. Expected: FAIL.
+- [ ] **Step 3: Implement.** Add `uuid` (v4) and run `cargo deny check`.
+- [ ] **Step 4: Run.** Unit tests PASS. With Docker, the `--ignored` tests PASS.
+- [ ] **Step 5: Commit.** `git commit -am "feat: semantic layer core, drift reconciliation, export/import"`

@@ -52,7 +52,8 @@ onto the code flow, checks configuration, and inspects datastores read-only.
 ```
 Cargo.toml              workspace: shared versions, lints
 deny.toml               dependency audit policy (cargo-deny)
-docker-compose.yml      Memgraph + Memgraph Lab, persistent named volumes
+docker-compose.yml      Memgraph + Memgraph Lab; data bind-mounted at docker/memgraph/ (planned)
+docker-compose.gpu.yml  optional GPU override for local embedding models (planned)
 .env.example            credentials template (copy to .env)
 services/
   engine/               library: config, discovery, parsing, graph, store, logs, datastores, LSP
@@ -91,6 +92,7 @@ cargo deny check                  # must pass before any dependency change is me
 
 Memgraph data lives in the named volumes `memgraph_data` and `memgraph_log`. They survive
 `docker compose down`; only `docker compose down -v` deletes them.
+*(Planned: data moves to a bind mount at `docker/memgraph/`, see the layer design.)*
 
 ### Using it on a workspace *(planned)*
 
@@ -99,6 +101,8 @@ ops init --root /path/to/workspace     # writes ops.yaml, .env.example, .mcp.jso
 $EDITOR /path/to/workspace/ops.yaml    # review the discovered services, libs, contracts, datastores
 ops check --root /path/to/workspace    # validates config; reports missing env vars and unreachable backends
 ops index --root /path/to/workspace    # parse and write the graph (add --dry-run to only print counts)
+ops watch --root /path/to/workspace    # keep the graph current as files change (incremental)
+ops knowledge export --root /path/to/workspace   # back up the semantic layer to ops-knowledge/ (commit it)
 claude mcp add ops -- ops-mcp --root /path/to/workspace --mode operational-support
 ```
 
@@ -249,9 +253,11 @@ To use several modes, register the server several times.
 | Graph and code | `service_map` (boundaries with evidence), `contract`, `find_symbol`, `code_context`, `trace_flow`, `read_file`, `graph_query` (read-only), `lsp` |
 | Operations | `fetch_logs`, `match_log`, `analyze_logs`, `compose_status`, `k8s_status`, `service_config`, `check_config` |
 | Data | `db_query`, `db_schema`, `redis_command`, `datastore_health` |
+| Semantic layer | `remember`, `revise`, `retract`, `recall`, `knowledge_gaps`, `search_code` |
+| Index and incidents | `reindex`, `save_incident_report`, `find_incident_reports` |
 
 Agent prompts: `diagnose`, `triage_logs`, `explain_flow`, `check_misconfiguration`,
-`investigate_datastore`, `write_rca`. `write_rca` produces an incident report from
+`investigate_datastore`, `write_rca`, `enrich_knowledge`. `write_rca` produces an incident report from
 [`services/mcp/templates/incident-report.md`](services/mcp/templates/incident-report.md): symptoms
 and how to recognize them, root cause with evidence, a checklist to validate a recurrence,
 mitigation and fix, a checklist to validate the resolution, prevention, and a runbook entry.
