@@ -408,7 +408,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `graph::file_graph(ctx: &Ctx, unit: &str /* service or lib name */, relpath: &str, src: &str) -> Option<FileGraph>`: `None` when the file is skipped.
   - `graph::workspace_graph(ctx: &Ctx) -> Result<Graph>`: Service/Datastore/EnvVar/Contract/Endpoint/Schema-from-OpenAPI nodes, plus docker edges (DEPENDS_ON CONNECTS_TO SHARES_VOLUME SETS_ENV USES_DATASTORE PROVIDES DECLARES DEFINES_SCHEMA). No per-file parsing.
   - `graph::LINK_RELS: &[&str] = &["CALLS","CALLS_API","USES_SCHEMA","IMPLEMENTED_BY","INJECTS","TEMPLATE_BINDS","USES_LIB","CONSUMES","BOUNDARY"]`
-  - `graph::link(ctx: &Ctx, nodes: &[Node]) -> (Vec<Edge>, usize /* unresolved calls */)`: computes every LINK_RELS edge from **node properties only**: `calls`, `http_calls`, `uses_types`, `injects`, `template_url`, `imports` (on File), `routes`, `qualname`, `unit`. It never reads files.
+  - `graph::link(ctx: &Ctx, nodes: &[Node], workspace_edges: &[Edge]) -> (Vec<Edge>, usize /* unresolved calls */)`: computes every LINK_RELS edge from node properties (`calls`, `http_calls`, `uses_types`, `injects`, `template_url`, `imports` on File, `routes`, `qualname`, `unit`) plus `workspace_edges` (`DEPENDS_ON`, `CONNECTS_TO`, `SHARES_VOLUME` and `PROVIDES`, needed for `BOUNDARY` and `CONSUMES`). It never reads files. `BOUNDARY` is computed last, from the other link edges and `workspace_edges`.
   - `graph::build(ctx: &Ctx) -> Result<Graph>`: `workspace_graph` + every `file_graph` + `link`. Used by `--dry-run`, by `--full` and by tests.
   - `graph::card(node: &Node) -> Option<String>`: the code-card text for Function/Class/Component/Injectable/Schema/Route: kind, qualname, signature, doc, decorators/route, log templates, file path, joined by newlines and capped at 2 KiB. `None` for other labels.
   - Labels and rels are exactly those in the spec's graph model. In full:
@@ -449,7 +449,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   let b = edge(&g, "BOUNDARY", "svc:frontend", "svc:orders").unwrap(); assert!(via(b).contains(&"http") && via(b).contains(&"contract"));
   let b = edge(&g, "BOUNDARY", "svc:orders", "svc:worker").unwrap(); assert!(via(b).contains(&"compose") && via(b).contains(&"shared_lib")); }
 #[test] fn ids_have_no_lines() { let g = build(&ctx()).unwrap(); assert!(g.nodes.iter().filter(|n| n.id.starts_with("sym:")).all(|n| !n.id.rsplit(':').next().unwrap().chars().all(|c| c.is_ascii_digit()))); }
-#[test] fn link_from_props_matches_build() { let g = build(&ctx()).unwrap(); let (mut l, _) = link(&ctx(), &g.nodes);
+#[test] fn link_from_props_matches_build() { let g = build(&ctx()).unwrap(); let ws: Vec<_> = g.edges.iter().filter(|e| !LINK_RELS.contains(&e.rel)).cloned().collect(); let (mut l, _) = link(&ctx(), &g.nodes, &ws);
   let mut b: Vec<_> = g.edges.iter().filter(|e| LINK_RELS.contains(&e.rel)).cloned().collect(); l.sort_by(|a,b| key(a).cmp(&key(b))); b.sort_by(|a,b| key(a).cmp(&key(b))); assert_eq!(keys(&l), keys(&b)); }
 #[test] fn card_contents() { let g = build(&ctx()).unwrap(); let c = card(node(&g, &id_of(&g, "Function", "pay"))).unwrap();
   assert!(c.contains("POST /api/orders/{order_id}/pay") && c.contains("payment failed for order %s") && c.contains("app/main.py")); }
@@ -505,21 +505,25 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `store::VanishedAnchor { knowledge_id: String, rel: String /* ABOUT|STEP|FROM|TO */, anchor_key: String, anchor_hash: String, qualname: Option<String>, unit: Option<String> }`
   - `store::index(ctx: &Ctx, mode: IndexMode, wait: Duration) -> Result<IndexReport>`. The algorithm is the layer design's §3:
     1. **Lock.** Take the lock, then run `ensure_indexes`.
-    2. **Fingerprint.** `fingerprint = sha256(ops version + canonical JSON of config.services, shared_libs, contracts, exclude, docker)`. If it differs from the latest `IndexRun.fingerprint`, mode becomes Full. (Task 7c adds the embedding fields to the fingerprint.)
+    2. **Fingerprint.** `parse_fingerprint = sha256(ops version + canonical JSON of config.services, shared_libs, contracts, exclude, docker)`. If it differs from the latest `IndexRun.parse_fingerprint`, mode becomes Full.
     3. **Plan.** Walk the files, then `MATCH (f:File {workspace:$ws, layer:'structural'}) RETURN f.path, f.hash`, and diff the two.
     4. **One transaction:**
-       - a. For each added or changed file: `file_graph`, then `UNWIND … MERGE (n:<Label> {id:r.id}) SET n = r` per label.
+       - a. For each added or changed file: `file_graph`, then `UNWIND … MERGE (n:<Label> {id:r.id}) SET n += r` per label. `r` carries **every** structural key, with null for absent ones, which removes them. `+=` keeps `embedding` and `card_hash`, which Task 7c owns; `SET n = r` would erase them.
          - Delete that file's old local edges (`CONTAINS DEFINES HAS_METHOD LOGS READS_ENV HANDLED_BY`) and create the new ones.
-         - Collect the ids the file produced before but no longer does.
-       - b. Deleted files: all their node ids.
-       - c. Workspace graph: MERGE its nodes. Delete structural nodes of labels Service/Datastore/EnvVar/Contract/Endpoint/Schema(openapi) that it no longer produces. Replace its edges.
-       - d. **Before deleting** the vanished ids: `MATCH (k:Knowledge)-[r]->(n) WHERE n.id IN $vanished` → `VanishedAnchor`s. Then `DETACH DELETE` those nodes, matching `layer:'structural'`.
-       - e. Relink: delete every edge whose type is in LINK_RELS within the workspace. Load all symbol, route and file nodes (props only), run `graph::link`, and create the result.
-       - f. Write `(:IndexRun {id, started_at, finished_at, mode, files_added, files_changed, files_deleted, fingerprint, git_head, workspace, layer:'structural'})`. Keep the newest 20.
+         - Collect the `(label, id)` pairs the file produced before but no longer does. Pairs, not bare ids: a symbol that changes kind (a Class gaining `BaseModel` becomes a Schema) keeps its id but changes label, so the old `:Class` node must count as vanished.
+       - b. Deleted files: all their `(label, id)` pairs.
+       - c. Workspace graph: MERGE its nodes (`SET n += r`, same rule). Delete structural nodes of labels Service/Datastore/EnvVar/Contract/Endpoint/Schema(openapi) that it no longer produces. Replace its edges.
+       - d. **Before deleting** the vanished nodes: `MATCH (k:Knowledge)-[r]->(n)` over the vanished `(label, id)` pairs → `VanishedAnchor`s. Then `DETACH DELETE` those nodes, matching `layer:'structural'`.
+       - d2. **Still inside the transaction**, after step e: `semantic::reattach_vanished(tx, &vanished)` (Task 7d). It re-attaches by qualname or records orphans, so a crash can never leave anchors cut while entries still read `current`. Until Task 7d lands, this is a no-op that returns the list unchanged.
+       - e. Relink: delete every edge whose type is in LINK_RELS within the workspace. Load all symbol, route and file nodes (props only) and the workspace edges (`DEPENDS_ON CONNECTS_TO SHARES_VOLUME PROVIDES`), run `graph::link(ctx, nodes, edges)`, and create the result.
+       - f. Write `(:IndexRun {id, started_at, finished_at, mode, files_added, files_changed, files_deleted, parse_fingerprint, embed_fingerprint, git_head, workspace, layer:'structural'})`. Keep the newest 20.
     5. **Commit.** On any error, roll back. The previous graph stays intact.
 
     Full mode is the same steps with every file treated as changed, plus: structural nodes not produced by this run are deleted (through step d). The structural layer is never wiped wholesale.
   - `IndexReport` is also what Task 7d's reconcile consumes (`vanished`, `run_id`).
+  - **Two fingerprints** on `IndexRun`:
+    - `parse_fingerprint` (ops version + config sections): a change forces a full re-parse.
+    - `embed_fingerprint` (Task 7c): a change forces only a vector rebuild and re-embed, with no re-parse.
 
 - [ ] **Step 1: Read the rsmgclient 4.0 API before coding.** Look in `~/.cargo/registry/src/*/rsmgclient-4.0.0/src/` and confirm:
   - `ConnectParams` (host, port, username, password, autocommit)
@@ -537,6 +541,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   edit(&ctx, "services/orders/app/main.py", |s| s.replace("def charge(", "def charge_card(").replace("charge(order_id)", "charge_card(order_id)"));
   let r = store::index(&ctx, IndexMode::Incremental, Duration::ZERO).unwrap(); assert_eq!(r.changed, 1);
   let inc = dump(&ctx); store::index(&ctx, IndexMode::Full, Duration::ZERO).unwrap(); assert_eq!(inc, dump(&ctx)); } // dump = sorted node ids+props and edge keys, excluding IndexRun
+#[test] #[ignore] fn kind_change_replaces_node() { /* make a fixture class subclass BaseModel → after an incremental run, exactly one node with that id exists, labelled Schema; the incremental graph equals the --full graph */ }
 #[test] #[ignore] fn deleted_file_removed() { /* delete services/worker/worker.py → its Function nodes and CALLS edges are gone; r.deleted == 1 */ }
 #[test] #[ignore] fn fingerprint_forces_reparse() { /* change a service's framework in ops.yaml → next incremental run reports fingerprint_changed and changed == every file */ }
 #[test] #[ignore] fn failed_run_keeps_previous_graph() { /* inject a failure after step 4a (test hook) → node count equals the count before the run */ }
@@ -611,7 +616,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - Vector indexes, when `info` is Some: `knowledge_vec ON :Knowledge(embedding)` and `code_vec ON :Function|Class|Component|Injectable|Schema|Route(embedding)`, with `{dimension, capacity: max(1024, 2 × count), metric, scalar_kind}`.
     - `rebuild_vectors` drops them first.
   - **In `store::index`**, after relink and outside the main transaction (vector indexes are READ_UNCOMMITTED):
-    - **Fingerprint:** also includes `model`, `dimensions`, `metric` and `scalar_kind`. A change sets `rebuild_vectors` and re-embeds everything, including `:Knowledge`.
+    - **`embed_fingerprint`** = sha256 of `model`, `dimensions`, `metric` and `scalar_kind`. A change sets `rebuild_vectors` and re-embeds everything, including `:Knowledge`. It does **not** trigger a re-parse.
     - **Re-embed only what changed:** nodes whose `card` changed (compare against a stored `card_hash`), plus every node when `rebuild_vectors` is set. `SET n.embedding = $vec, n.card_hash = $h`.
     - **`--full`** always sets `rebuild_vectors`, because deleted nodes don't free vector-index memory until the index is dropped.
     - **`TextOnly`:** skip embedding, and record the reason in `IndexReport.embedding: String`.
@@ -623,7 +628,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   assert_eq!(m["model_name"], "voyage/voyage-3"); assert_eq!(m["input_type"], "query"); assert_eq!(m["dimensions"], 512); assert!(!m.contains_key("metric") && !m.contains_key("api_base")); }
 #[test] fn disabled_is_text_only() { assert!(matches!(status(&ctx_with("semantic: {embeddings: {enabled: false}}")), EmbedStatus::TextOnly(_))); }
 #[test] #[ignore] fn embeds_cards_default_model() { /* MAGE image: index fixture → every Function has `embedding` of length 384; second incremental run re-embeds 0; editing pay's docstring re-embeds exactly 1 */ }
-#[test] #[ignore] fn model_change_rebuilds() { /* change model to another local model with a different dim → fingerprint_changed, vector index recreated with the new dimension */ }
+#[test] #[ignore] fn model_change_rebuilds() { /* change model to another local model with a different dim → vector index recreated with the new dimension; report.changed == 0 (no re-parse) */ }
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine embed`. Expected: FAIL.
 - [ ] **Step 3: Implement.** Before coding, confirm the procedure signatures with `CALL mg.procedures() YIELD name, signature WHERE name STARTS WITH 'embeddings' OR name STARTS WITH 'vector_search' OR name STARTS WITH 'text_search' RETURN *`.
@@ -636,7 +641,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 
 **Files:**
 - Create: `services/engine/src/semantic.rs`
-- Modify: `services/engine/src/store.rs` (call `reconcile` at the end of `index`), `services/cli/src/main.rs` (`ops knowledge`), root `Cargo.toml` (add `uuid` with `v4`)
+- Modify: `services/engine/src/store.rs` (call `reattach_vanished` at step d2, inside the transaction, and `reconcile` after commit), `services/cli/src/main.rs` (`ops knowledge`), root `Cargo.toml` (add `uuid` with `v4`)
 
 **Interfaces:**
 - Consumes: `store::{query, IndexReport, VanishedAnchor}`, `embed::embed_texts`, `redact`
@@ -653,7 +658,8 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `semantic::get(ctx, id) -> Result<Entry>`, and `semantic::about(ctx, node_ids: &[String], include_stale: bool) -> Result<Vec<Entry>>`: entries anchored (`ABOUT`/`STEP`/`FROM`/`TO`) to any of the nodes, excluding `retracted`.
   - `semantic::revise(ctx, id, patch: Patch) -> Result<String>`: a new entry that `SUPERSEDES` the old one; the old one gets `status: retracted`.
   - `semantic::retract(ctx, id, reason) -> Result<()>`: sets `status: retracted` and appends the reason. It never deletes.
-  - `semantic::reconcile(ctx, report: &IndexReport) -> Result<ReconcileReport { stale: usize, orphaned: usize, reattached: usize }>`. Implements the layer design's §4.3:
+  - `semantic::reattach_vanished(tx: &mut Connection, vanished: &[VanishedAnchor]) -> Result<(usize /* reattached */, usize /* orphaned */)>`: runs **inside** `store::index`'s transaction (Task 7 step d2). It's the vanished half of the rules below.
+  - `semantic::reconcile(ctx, report: &IndexReport) -> Result<ReconcileReport { stale: usize, orphaned: usize, reattached: usize }>`: runs after commit and does only the hash-based stale marking for surviving anchors. Implements the layer design's §4.3:
     - **Surviving anchors:** recompute `anchor_hash`. If it differs: `status: stale`, `stale_since: run_id`.
     - **`report.vanished`:** if exactly one symbol in the same `unit` has the same `qualname`, re-create the edge to it and mark the entry stale. Otherwise add the `anchor_key` to `orphaned_anchors`; once the entry has no live anchors, set `status: orphaned`.
     - `retracted` entries are skipped.
@@ -679,6 +685,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   let e = semantic::get(&ctx, &k).unwrap(); assert_eq!(e.status, Status::Current); assert_eq!(e.anchors.len(), 1); }
 #[test] #[ignore] fn stale_on_body_change() { /* summary about pay; edit pay's body; incremental index → status Stale, stale_since == report.run_id; whitespace-only edit → still Current */ }
 #[test] #[ignore] fn reattach_on_move_and_orphan_on_delete() { /* move `charge` to services/orders/app/billing.py → entry re-anchored to the new id, Stale; delete charge entirely → Orphaned with orphaned_anchors == [old id] */ }
+#[test] #[ignore] fn crash_during_reattach_keeps_anchors() { /* test hook makes reattach_vanished fail → the transaction rolls back: the old nodes, the ABOUT edges and the entry status are all unchanged */ }
 #[test] #[ignore] fn secret_redacted_on_write() { /* body "token=abc123" → stored body contains "token=***" */ }
 #[test] #[ignore] fn import_after_index() { /* export → wipe Memgraph → import before index → Err "run `ops index` first"; index then import → entries Current, anchors attached */ }
 ```

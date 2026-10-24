@@ -404,7 +404,12 @@ semantic:
   category.
 - `diagnose` step 0 calls it, so past reports are the first reference.
 
-## 6. Changes to existing docs and plans (after approval)
+## 6. Changes to existing docs and plans (applied)
+
+Applied in the base spec and both plans. Two refinements came out of plan review:
+- Vanished-anchor handling runs inside the index transaction.
+- The fingerprint is split into parse and embed parts, so a model change re-embeds without re-parsing.
+
 - Base spec: stable ids (§2.1), the `layer` property, `body_hash`, `IndexRun`, the semantic layer
   summary, incident files, the `docker/memgraph/` bind mount; no named volumes.
 - `.gitignore`: `/docker/` is already ignored; update its comment to say it holds the Memgraph bind mount (data, logs, model cache).
