@@ -58,6 +58,7 @@ services/
   engine/               library: config, discovery, parsing, graph, store, logs, datastores, LSP
   cli/                  binary `ops`
   mcp/                  binary `ops-mcp`
+    templates/          incident-report.md: the template `write_rca` fills
 docs/superpowers/       design spec and implementation plans
 ```
 
@@ -98,7 +99,7 @@ ops init --root /path/to/workspace     # writes ops.yaml, .env.example, .mcp.jso
 $EDITOR /path/to/workspace/ops.yaml    # review the discovered services, libs, contracts, datastores
 ops check --root /path/to/workspace    # validates config; reports missing env vars and unreachable backends
 ops index --root /path/to/workspace    # parse and write the graph (add --dry-run to only print counts)
-claude mcp add ops -- ops-mcp --root /path/to/workspace
+claude mcp add ops -- ops-mcp --root /path/to/workspace --mode operational-support
 ```
 
 ## Configuration — `ops.yaml`
@@ -145,12 +146,30 @@ services:
 datastores:
   - { name: orders-db, kind: postgres, url: { env: ORDERS_DB_URL } }
   - { name: cache, kind: redis, url: "redis://localhost:6379/0", password: { env: REDIS_PASSWORD } }
+logging:                                            # optional; these are the defaults
+  level: info                                       # OPS_LOG overrides it (e.g. OPS_LOG=engine=debug)
+  format: text                                      # stderr: text | json
+  dir: .ops/logs                                    # rotated daily: ops-mcp.*.jsonl, ops.*.jsonl, audit.*.jsonl
+  retention_days: 14
+  audit: true                                       # one redacted record per MCP tool call
 ```
 
 Override any value without editing the file using `OPS_`-prefixed env vars, with `__` between
 nesting levels, for example `OPS_MEMGRAPH__PORT=7688`.
 
-## MCP surface *(planned)*
+## Modes
+
+`ops-mcp --mode <mode>` picks one bundle of tools, prompts and instructions per server process.
+To use several modes, register the server several times.
+
+| Mode | For | Status |
+|---|---|---|
+| `operational-support` | Incidents: logs → code flow → root cause → fix | **MVP** (default) |
+| `developer-support` | Context for code changes from the service graph, combined with your LSP setup, context files, prompts and hooks | planned |
+| `operational-onboarding` | Do's and don'ts for operating the system, from the graph and your runbooks; no production access | planned |
+| `developer-onboarding` | A fast guided tour of the codebase | planned |
+
+## MCP surface: `operational-support` *(planned)*
 
 | Group | Tools |
 |---|---|
@@ -159,7 +178,10 @@ nesting levels, for example `OPS_MEMGRAPH__PORT=7688`.
 | Data | `db_query`, `db_schema`, `redis_command`, `datastore_health` |
 
 Agent prompts: `diagnose`, `triage_logs`, `explain_flow`, `check_misconfiguration`,
-`investigate_datastore`, `write_rca`.
+`investigate_datastore`, `write_rca`. `write_rca` produces an incident report from
+[`services/mcp/templates/incident-report.md`](services/mcp/templates/incident-report.md): symptoms
+and how to recognize them, root cause with evidence, a checklist to validate a recurrence,
+mitigation and fix, a checklist to validate the resolution, prevention, and a runbook entry.
 
 ## Safety model
 
@@ -170,8 +192,13 @@ Agent prompts: `diagnose`, `triage_logs`, `explain_flow`, `check_misconfiguratio
   Use a read-only DB user as well.
 - **Redis** accepts only an allow-list of read commands.
 - **`graph_query`** rejects write clauses. The graph can always be rebuilt with `ops index`.
+- **`read_file` and `lsp`** read only configured service, library and contract paths, compose files and
+  Dockerfiles. `.env*`, `.ops/` and `ops.yaml` are always denied.
 - **Kubernetes** calls are limited to `kubernetes.namespaces`. Arguments from the LLM are never
   passed through a shell.
+- **Every tool call is audited** to `.ops/logs/audit.*.jsonl`: tool, redacted arguments (SQL and
+  commands included), outcome, duration, backends touched and result size. Result content is never
+  recorded.
 - **`ops-mcp` starts even when every backend is down.** Tools connect on demand and report
   failures as text.
 
