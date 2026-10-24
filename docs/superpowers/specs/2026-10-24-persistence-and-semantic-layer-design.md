@@ -54,10 +54,10 @@ So:
 `docker-compose.yml` mounts Memgraph's data and log directories onto the repo:
 ```yaml
 volumes:
-  - ./.data/memgraph/lib:/var/lib/memgraph
-  - ./.data/memgraph/log:/var/log/memgraph
+  - ./docker/memgraph/lib:/var/lib/memgraph
+  - ./docker/memgraph/log:/var/log/memgraph
 ```
-- `.data/` is git-ignored. The named volumes `memgraph_data` / `memgraph_log` go away.
+- `docker/` is already git-ignored (`/docker/` in `.gitignore`). The named volumes `memgraph_data` / `memgraph_log` go away.
 - Memgraph must recover from its snapshot and WAL on startup. Confirm the exact flag in
   `memgraph --help` (`--data-recovery-on-startup`) and set it explicitly in `command:`. Also set a
   periodic snapshot (`--storage-snapshot-interval-sec`, e.g. 300) and snapshot-on-exit.
@@ -339,8 +339,8 @@ semantic:
 
 ## 6. Changes to existing docs and plans (after approval)
 - Base spec: stable ids (§2.1), the `layer` property, `body_hash`, `IndexRun`, the semantic layer
-  summary, incident files, the `.data/` bind mount; no named volumes.
-- `.gitignore`: add `.data/`.
+  summary, incident files, the `docker/memgraph/` bind mount; no named volumes.
+- `.gitignore`: `/docker/` is already ignored; update its comment to say it holds the Memgraph bind mount (data, logs, model cache).
 - Part 1 plan:
   - Task 0 is no longer "verify only": the compose file changes to the bind mount with recovery flags.
   - Task 6: stable ids, `body_hash`, facts stored on nodes.
