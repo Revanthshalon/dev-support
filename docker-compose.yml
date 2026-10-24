@@ -1,31 +1,58 @@
-# Local Memgraph for ops-support. Credentials come from .env (see .env.example).
-# Data lives in named volumes and survives `docker compose down`; only `down -v` deletes it.
+# Local Memgraph for ops-support. Credentials and embedding-provider keys come from .env
+# (see .env.example). Data is bind-mounted under ./docker/memgraph/ and survives
+# `docker compose down`; delete that directory to start from an empty graph.
 services:
   memgraph:
-    image: memgraph/memgraph-mage:latest
+    image: memgraph/memgraph-mage:3.14.0
     container_name: memgraph-mage
     ports:
-      - "7687:7687" # Bolt
-      - "7444:7444" # log streaming
-    command: ["--log-level=WARNING", "--also-log-to-stderr", "--storage-properties-on-edges=true"]
+      # Loopback only: the defaults fall back to ops/ops when .env is absent.
+      - "127.0.0.1:7687:7687" # Bolt
+      - "127.0.0.1:7444:7444" # log streaming
+    command:
+      - --log-level=WARNING
+      - --also-log-to-stderr
+      - --storage-properties-on-edges=true
+      - --data-recovery-on-startup=true
+      - --storage-snapshot-interval-sec=300
+      - --storage-snapshot-on-exit=true
     volumes:
-      - memgraph_data:/var/lib/memgraph
-      - memgraph_log:/var/log/memgraph
+      - ./docker/memgraph/lib:/var/lib/memgraph
+      - ./docker/memgraph/log:/var/log/memgraph
+    # The whole .env reaches Memgraph, so LiteLLM inside it sees provider keys (OPENAI_API_KEY, …).
+    env_file:
+      - path: .env
+        required: false
     environment:
       - MEMGRAPH_USER=${MEMGRAPH_USER:-ops}
       - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD:-ops}
+      - HF_HOME=/var/lib/memgraph/hf-cache # model cache on the bind mount: downloads once
 
-  lab:
-    image: memgraph/lab:latest
-    container_name: memgraph-lab
-    ports:
-      - "3000:3000"
+  # One-shot: `docker compose --profile embeddings up -d` loads EMBEDDINGS_MODEL now (downloading
+  # it if needed) and checks the provider key, instead of failing at the first `ops index`.
+  embeddings-warmup:
+    image: memgraph/memgraph-mage:3.14.0 # ships mgconsole and a shell (the mgconsole image has no shell)
+    profiles: [embeddings]
     depends_on:
       - memgraph
+    restart: "no"
     environment:
-      - QUICK_CONNECT_MG_HOST=memgraph
-      - QUICK_CONNECT_MG_PORT=7687
+      - MEMGRAPH_USER=${MEMGRAPH_USER:-ops}
+      - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD:-ops}
+      - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL:-all-MiniLM-L6-v2}
+    volumes:
+      - ./scripts/embeddings-warmup.sh:/warmup.sh:ro
+    entrypoint: ["/bin/sh", "/warmup.sh"]
 
-volumes:
-  memgraph_data:
-  memgraph_log:
+  lab:
+    image: memgraph/lab:3.14.0 # same release as memgraph-mage; pinned like it
+    container_name: memgraph-lab
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - memgraph
+    # Lab's quick-connect is anonymous-only (no username/password setting), and Memgraph has auth on,
+    # so it would fail every 2 s. Log in via "Connect manually": host memgraph, port 7687, and
+    # MEMGRAPH_USER / MEMGRAPH_PASSWORD from .env.
+    environment:
+      - QUICK_CONNECT_IS_DISABLED=true

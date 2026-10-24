@@ -1,0 +1,15 @@
+# Optional override: local embedding models on NVIDIA GPUs (amd64 only).
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+# Needs the NVIDIA Container Toolkit on the host. The default image ships a CPU-only PyTorch,
+# so this switches to the CUDA build; reserving the GPU alone wouldn't use it.
+# Docker Desktop on macOS has no GPU passthrough: local models run on CPU there.
+services:
+  memgraph:
+    image: memgraph/memgraph-mage:3.14.0-relwithdebinfo-cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

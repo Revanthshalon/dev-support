@@ -7,7 +7,7 @@
 .env.*
 !.env.example
 
-# Local data from bind-mounted Docker volumes (memgraph now uses named volumes)
+# Memgraph bind mount: data, logs, model cache
 /docker/
 
 # Logs
@@ -16,6 +16,7 @@
 # Local code-intelligence indexes / tool caches
 .codegraph/
 .serena/
+.superpowers/
 
 # Editors and OS
 .idea/
