@@ -52,7 +52,8 @@ onto the code flow, checks configuration, and inspects datastores read-only.
 ```
 Cargo.toml              workspace: shared versions, lints
 deny.toml               dependency audit policy (cargo-deny)
-docker-compose.yml      Memgraph + Memgraph Lab, persistent named volumes
+docker-compose.yml      Memgraph + Memgraph Lab; data bind-mounted at docker/memgraph/ (planned)
+docker-compose.gpu.yml  optional GPU override for local embedding models (planned)
 .env.example            credentials template (copy to .env)
 services/
   engine/               library: config, discovery, parsing, graph, store, logs, datastores, LSP
@@ -91,6 +92,7 @@ cargo deny check                  # must pass before any dependency change is me
 
 Memgraph data lives in the named volumes `memgraph_data` and `memgraph_log`. They survive
 `docker compose down`; only `docker compose down -v` deletes them.
+*(Planned: data moves to a bind mount at `docker/memgraph/`, see the layer design.)*
 
 ### Using it on a workspace *(planned)*
 
@@ -99,6 +101,8 @@ ops init --root /path/to/workspace     # writes ops.yaml, .env.example, .mcp.jso
 $EDITOR /path/to/workspace/ops.yaml    # review the discovered services, libs, contracts, datastores
 ops check --root /path/to/workspace    # validates config; reports missing env vars and unreachable backends
 ops index --root /path/to/workspace    # parse and write the graph (add --dry-run to only print counts)
+ops watch --root /path/to/workspace    # keep the graph current as files change (incremental)
+ops knowledge export --root /path/to/workspace   # back up the semantic layer to ops-knowledge/ (commit it)
 claude mcp add ops -- ops-mcp --root /path/to/workspace --mode operational-support
 ```
 
@@ -157,6 +161,79 @@ logging:                                            # optional; these are the de
 Override any value without editing the file using `OPS_`-prefixed env vars, with `__` between
 nesting levels, for example `OPS_MEMGRAPH__PORT=7688`.
 
+## Embeddings and semantic search *(planned)*
+
+> [!NOTE]
+> Designed in [`2026-10-24-persistence-and-semantic-layer-design.md`](docs/superpowers/specs/2026-10-24-persistence-and-semantic-layer-design.md) §4.5.
+> Uses Memgraph's native vector indexes, text indexes and the MAGE `embeddings` module, all in the
+> free Community edition. ops-support adds no ML dependency of its own.
+
+The model name picks the path:
+- **A bare name or Hugging Face path** (the default, `all-MiniLM-L6-v2`) runs locally inside
+  Memgraph. No key is needed.
+- **`provider/model`** (`openai/text-embedding-3-small`, `voyage/voyage-3`,
+  `ollama/nomic-embed-text`, …) is called remotely through LiteLLM.
+
+Memgraph reads provider API keys from **its own container environment**, never from `ops.yaml`.
+That's why keys are set in `.env` before `docker compose up`.
+
+### 1. When starting Docker: `.env` in this repo
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `EMBEDDINGS_MODEL` | `all-MiniLM-L6-v2` | Model the warmup service loads; keep it equal to `semantic.embeddings.model` |
+| `HF_TOKEN` | unset | Gated or private Hugging Face models |
+| `HF_HUB_OFFLINE` | `0` | `1` = never download (air-gapped; pre-seed `docker/memgraph/lib/hf-cache`) |
+| `OPENAI_API_KEY` | unset | `openai/…` |
+| `AZURE_API_KEY`, `AZURE_API_BASE`, `AZURE_API_VERSION` | unset | `azure/<deployment>` |
+| `COHERE_API_KEY` | unset | `cohere/…` |
+| `VOYAGE_API_KEY` | unset | `voyage/…` |
+| `MISTRAL_API_KEY` | unset | `mistral/…` |
+| `GEMINI_API_KEY` | unset | `gemini/…` |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION_NAME` | unset | `bedrock/…` |
+
+Ollama needs no key; point `api_base` at it in `ops.yaml`. Any other LiteLLM provider variable
+works too, because the whole `.env` is passed to the Memgraph container.
+
+```sh
+docker compose up -d                                   # defaults: local model on CPU, downloaded on first use
+docker compose --profile embeddings up -d              # also download/load EMBEDDINGS_MODEL and check its key now
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d   # NVIDIA GPU for local models (Linux)
+```
+
+### 2. Per workspace: `ops.yaml`
+
+Every field accepts a literal or `{ env: NAME }`, and can be overridden with
+`OPS_SEMANTIC__EMBEDDINGS__<FIELD>`.
+
+```yaml
+semantic:
+  embeddings:
+    enabled: true              # false = text search only
+    model: all-MiniLM-L6-v2    # bare/HF name → local; provider/model → remote (LiteLLM)
+    # local only
+    device: null               # null (first GPU, else CPU) | cpu | cuda | all | "cuda:1" | 1 | [0, 1]
+    batch_size: 2000
+    chunk_size: 48             # per-GPU chunk, multi-GPU path
+    # remote only
+    api_base: null             # Ollama, Azure, proxies
+    input_type: document       # how code cards and knowledge are embedded
+    query_input_type: query    # how search queries are embedded (Cohere/Voyage use it)
+    dimensions: null           # truncate output, if the provider supports it
+    timeout: 60
+    num_retries: 3
+    normalize: true
+    remote_batch_size: null    # null = 96 for Cohere, 256 otherwise
+    concurrency: 4             # 1–32 parallel requests
+    # vector index
+    metric: cos
+    scalar_kind: f32
+```
+
+Changing `model`, `dimensions`, `metric` or `scalar_kind` rebuilds the vector indexes and
+re-embeds everything on the next `ops index`. `ops check` reports which path is active (local, or
+remote with the provider), the vector dimension, and any load or key error.
+
 ## Modes
 
 `ops-mcp --mode <mode>` picks one bundle of tools, prompts and instructions per server process.
@@ -176,9 +253,11 @@ To use several modes, register the server several times.
 | Graph and code | `service_map` (boundaries with evidence), `contract`, `find_symbol`, `code_context`, `trace_flow`, `read_file`, `graph_query` (read-only), `lsp` |
 | Operations | `fetch_logs`, `match_log`, `analyze_logs`, `compose_status`, `k8s_status`, `service_config`, `check_config` |
 | Data | `db_query`, `db_schema`, `redis_command`, `datastore_health` |
+| Semantic layer | `remember`, `revise`, `retract`, `recall`, `knowledge_gaps`, `search_code` |
+| Index and incidents | `reindex`, `save_incident_report`, `find_incident_reports` |
 
 Agent prompts: `diagnose`, `triage_logs`, `explain_flow`, `check_misconfiguration`,
-`investigate_datastore`, `write_rca`. `write_rca` produces an incident report from
+`investigate_datastore`, `write_rca`, `enrich_knowledge`. `write_rca` produces an incident report from
 [`services/mcp/templates/incident-report.md`](services/mcp/templates/incident-report.md): symptoms
 and how to recognize them, root cause with evidence, a checklist to validate a recurrence,
 mitigation and fix, a checklist to validate the resolution, prevention, and a runbook entry.
