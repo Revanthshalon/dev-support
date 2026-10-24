@@ -56,7 +56,7 @@ services:
           echo "$$out" | sed -E 's/(sk-|key["'"'"']?[=:] *["'"'"']?)[A-Za-z0-9_-]{6,}/\1***/Ig' >&2; exit 1; fi
 
   lab:
-    image: memgraph/lab:latest
+    image: memgraph/lab:3.14.0 # same release as memgraph-mage; pinned like it
     container_name: memgraph-lab
     ports:
       - "3000:3000"
