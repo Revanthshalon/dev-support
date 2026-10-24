@@ -13,7 +13,7 @@ So it's tested without a database. `store` is the only module that talks to Memg
 
 **Tech Stack:** Rust 2024, clap 4.6 (derive), config 0.15 (yaml), serde, serde_norway 0.9, serde_json, regex, walkdir, shlex, tree-sitter 0.27 + tree-sitter-python 0.25, tree-sitter-typescript 0.23, tree-sitter-html 0.23, tree-sitter-css 0.25, tree-sitter-yaml 0.7, tree-sitter-json 0.24, tree-sitter-containerfile 0.9, rsmgclient 4.0, tokio, anyhow.
 
-**Spec:** `docs/superpowers/specs/2026-10-24-ops-support-design.md`, plus `docs/superpowers/specs/2026-10-24-persistence-and-semantic-layer-design.md` ("the layer design"; it wins where the two differ)
+**Spec:** `docs/superpowers/specs/2026-10-24-ops-support-design.md`, plus `docs/superpowers/specs/2026-10-24-persistence-and-semantic-layer-design.md` ("the layer design"; it wins where the two differ), and `docs/superpowers/specs/2026-10-24-execution-flow-and-investigation-tools-design.md` ("the flow design")
 
 ## Global Constraints
 - The workspace stays `services/{engine,cli,mcp}`. The `cli` binary is named `ops`, and the `mcp` binary is named `ops-mcp`.
@@ -101,6 +101,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `IndexingCfg { max_file_bytes: EnvOr<ByteSize> /* 1MiB */, skip_minified: bool /* true */, overrides: Vec<Override { path: String /* glob */, max_file_bytes: Option<ByteSize>, skip: bool }> }`, plus `indexing::limit_for(cfg, relpath) -> Limit { max_bytes: Option<u64>, skip: bool }`: first matching glob wins. Add `globset` and run `cargo deny check`.
   - `ChunkingCfg { enabled: bool /* true */, max_tokens: MaxTokens /* Auto | N */, remote_max_tokens: usize /* 512 */, overlap_tokens: usize /* 32 */, max_chunks_per_symbol: usize /* 32 */, strategy: Strategy /* syntax | lines */, aggregate: Aggregate /* max | mean_top2 */ }` as `EmbeddingsCfg.chunking` (`#[serde(default)]`). Validate `overlap_tokens < max_tokens` when `max_tokens` is a number.
   - `Config` gains `indexing: IndexingCfg` (`#[serde(default)]`).
+  - `CorrelationCfg { patterns: Vec<String> /* the 3 defaults in flow design §2.1 */, clock_skew_ms: u64 /* 500 */ }` and `ChangesCfg { since: String /* "7d" */ }`, as `Config.correlation` and `Config.changes` (`#[serde(default)]`). `validate` compiles each pattern and reports one without a named `id` group, and checks `since` against `^\d+[dhw]$` (max 90d).
   - `Config` gains `semantic: SemanticCfg` and `incidents: IncidentsCfg`, both `#[serde(default)]`.
   - `Service { name, path, language, framework: Framework, uses: Vec<String>, api: Option<Api{prefix: String}>, docker: Option<ServiceDocker{compose_service: Option<String>, dockerfile: Option<String>}>, kubernetes: Option<ServiceK8s{namespace, selector, container: Option<String>}>, logs: Option<LogsCfg>, datastores: Vec<String>, lsp: Option<Vec<String>> }`
   - `enum Framework { Fastapi, Worker, Angular, None }` (serde lowercase)
@@ -133,6 +134,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 #[test] fn byte_size_and_overrides() { assert_eq!("8MiB".parse::<ByteSize>().unwrap().0, 8 << 20); assert_eq!("0".parse::<ByteSize>().unwrap().0, 0); assert!("8MB?".parse::<ByteSize>().is_err());
   /* deserializes from YAML string "8MiB", YAML integer 8388608, and env string "8388608" alike */
   /* overrides [legacy/**/*.py → 8MiB, **/generated/** → skip]: limit_for("services/legacy/a/x.py").max_bytes == Some(8<<20); limit_for("x/generated/y.ts").skip; default → Some(1<<20); max_file_bytes 0 → None */ }
+#[test] fn correlation_and_changes_defaults() { /* defaults: 3 patterns, skew 500, since "7d"; a pattern without (?P<id>…) → validate problem; since "1y" → problem; the traceparent default extracts "4bf92f3577b34da6a3ce929d0e0e4736" from "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" */ }
 #[test] fn chunking_defaults() { /* no chunking section → enabled, MaxTokens::Auto, overlap 32, max_chunks 32, Strategy::Syntax, Aggregate::Max; overlap 300 with max_tokens 256 → validate problem */ }
 #[test] fn ops_env_override() { /* tmp ops.yaml port 7687; with OPS_MEMGRAPH__PORT=7688 set for the test → ctx.config.memgraph.port == 7688 (u16; may need config's try_parsing(true)) */ }
 #[test] fn dotenv_fallback_and_process_env_wins() { /* tmp dir with ops.yaml + .env FOO=a; assert ctx.env("FOO")==Some("a") */ }
@@ -219,6 +221,15 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `@router.post("/{order_id}/pay") def pay(order_id, db=Depends(get_db))` calls `charge(order_id)`, and inside `except` calls `logger.error("payment failed for order %s", order_id)`.
   - `def charge(...)` reads `os.getenv("PAYMENT_GATEWAY_URL")`.
   - `app.include_router(router, prefix="/api")`.
+- **Flow fixture additions** (flow design §7), all in the files above:
+  - `services/orders/app/main.py`:
+    - `class PaymentGatewayError(Exception)`;
+    - `charge` raises it, and reads `select(Order)`;
+    - `pay` wraps `charge(...)` in `try/except Exception:`, logs, then `raise HTTPException(status_code=502)`, and runs `db.execute("INSERT INTO payments (id) VALUES (%s)", order_id)` and `r.lpush("jobs:pay", order_id)`;
+    - `@app.exception_handler(ValueError) async def on_value_error(req, exc)` returns `JSONResponse(status_code=422, …)`;
+    - `refund_order` calls `refund.delay(order_id)`.
+  - `libs/common/common/models.py` adds `class Order(Base): __tablename__ = "orders"`.
+  - `services/worker/worker.py`: `run()` loops on `r.brpop("jobs:pay")`, and `@celery.task(name="orders.refund") def refund(oid)` has `autoretry_for=(TimeoutError,)`.
 - `services/orders/app/refunds.py`: one long function `reconcile_refunds`, about 200 lines of simple statements (loops over refunds, ledger updates). Its **last** block contains a comment and a log line mentioning "refund ledger". It's used by the chunking tests in Task 6, Task 7c and Part 2 Task 8b.
 - `services/worker/requirements.txt`, and `services/worker/worker.py` with `def run(): log.warning(f"retrying job {job_id}")` and `if __name__ == "__main__": run()`.
 - `libs/common/pyproject.toml` and `libs/common/common/db.py` with `def get_db()`. `orders/app/main.py` does `from common.db import get_db`.
@@ -285,7 +296,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 - Produces (in `parse/mod.rs`; Task 5 adds to the same types):
   - `enum Lang { Python, TypeScript, JavaScript, Html, Css }` and `Lang::from_path(&Path) -> Option<Lang>` (`.py`, `.ts`, `.js`/`.mjs`/`.cjs`, `.html`, `.css`; `.d.ts`, `*.spec.ts` and `*.min.js` give `None`)
   - `FileFacts { imports: Vec<String>, symbols: Vec<Symbol>, env_reads: Vec<String> /* module level */, template: Option<TemplateFacts>, css_selectors: Vec<String> }`
-  - `Symbol { kind: SymbolKind, name: String, owner: Option<String>, start_line: usize, end_line: usize, signature: String, decorators: Vec<String>, calls: Vec<String>, logs: Vec<LogStmt>, routes: Vec<Route>, http_calls: Vec<HttpCall>, env_reads: Vec<String>, injects: Vec<String>, entrypoint: bool, selector: Option<String>, template_url: Option<String>, qualname: String /* Owner.name or outer.inner */, doc: Option<String> /* docstring / JSDoc, ≤ 1 KiB */, body_hash: String /* sha256 hex of the symbol's non-comment tokens joined by one space */ }`
+  - `Symbol { kind: SymbolKind, name: String, owner: Option<String>, start_line: usize, end_line: usize, signature: String, decorators: Vec<String>, calls: Vec<Call { name: String, line: usize }>, logs: Vec<LogStmt>, routes: Vec<Route>, http_calls: Vec<HttpCall>, env_reads: Vec<String>, injects: Vec<String>, entrypoint: bool, selector: Option<String>, template_url: Option<String>, qualname: String /* Owner.name or outer.inner */, doc: Option<String> /* docstring / JSDoc, ≤ 1 KiB */, body_hash: String /* sha256 hex of the symbol's non-comment tokens joined by one space */, raises: Vec<Raise { type_name: String, line: usize, status: Option<u16> }>, handlers: Vec<Handler { types: Vec<String> /* [] = catch-all */, try_start: usize, try_end: usize, line: usize, action: HandlerAction /* Reraise | Return | Log | Swallow */, status: Option<u16>, reraise_as: Option<String> }>, bases: Vec<String>, handles_exception: Option<(String, Option<u16>)>, queue_ops: Vec<QueueOp { op: QueueDir /* Send | Receive */, queue: Option<String> /* None for a Celery send */, task_ref: Option<String> /* Celery send: receiver fn name, or a send_task literal */, flavor: Flavor /* RedisList | RedisStream | Pubsub | Celery | Rq */, line: usize }>, db_ops: Vec<DbOp { table: Option<String> /* SQL */, model: Option<String> /* ORM: model class name, resolved in link */, access: Access /* Read | Write */, via: Via /* Sql | Orm */, line: usize }>, table: Option<String> /* __tablename__ */, task: Option<TaskInfo { name: String, autoretry_for: Vec<String>, bound_retry: bool }> }`. `Symbol::call_names() -> impl Iterator<Item = &str>` is a helper.
   - `enum SymbolKind { Function, Method, Class, Component, Injectable, Schema }`. `Schema` = pydantic `BaseModel` subclass, TS `interface`, or exported TS `type` alias.
   - `Symbol.uses_types: Vec<String>`: the type names in parameter and return annotations (generics unwrapped: `list[PayRequest]` → `PayRequest`; builtins dropped).
   - `LogStmt { level: String /* trace|debug|info|warn|error */, template: String, line: usize }`
@@ -300,7 +311,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 ```rust
 #[test] fn fastapi_route_with_router_and_include_prefix() { let f = parse_file(Lang::Python, MAIN_PY);
   let pay = sym(&f, "pay"); assert_eq!(pay.routes[0].method, "POST"); assert_eq!(pay.routes[0].path, "/api/orders/{order_id}/pay");
-  assert!(pay.calls.contains(&"charge".into()) && pay.calls.contains(&"get_db".into())); // Depends(get_db) counts as a call
+  assert!(pay.call_names().any(|c| c == "charge") && pay.call_names().any(|c| c == "get_db")); // Depends(get_db) counts as a call
   assert_eq!(pay.logs[0].level, "error"); assert_eq!(pay.logs[0].template, "payment failed for order %s"); }
 #[test] fn env_reads_all_forms() { // os.getenv("A"), os.environ["B"], os.environ.get("C"), os.getenv("E", "dflt"), class S(BaseSettings): d_url: str  → "D_URL"
   assert_eq!(sorted(all_env_reads(&f)), ["A","B","C","D_URL","E?"]); } // trailing "?" = read has a default
@@ -313,6 +324,22 @@ The workspace setup below is already in the repo; only check it. The compose cha
   assert!(template_regex("{}").is_none()); }
 #[test] fn pydantic_schema_and_annotations() { let f = parse_file(Lang::Python, MODELS_PY); assert_eq!(sym(&f, "PayRequest").kind, SymbolKind::Schema);
   let f = parse_file(Lang::Python, MAIN_PY); assert_eq!(sym(&f, "pay").uses_types, ["PayRequest"]); }
+#[test] fn raises_and_handlers() { let f = parse_file(Lang::Python, MAIN_PY); let pay = sym(&f, "pay"); let h = &pay.handlers[0];
+  assert_eq!(h.types, ["Exception"]); assert_eq!(h.action, HandlerAction::Reraise); assert_eq!((h.reraise_as.as_deref(), h.status), (Some("HTTPException"), Some(502)));
+  let c = pay.calls.iter().find(|c| c.name == "charge").unwrap(); assert!(h.try_start <= c.line && c.line <= h.try_end);
+  assert_eq!(sym(&f, "charge").raises[0].type_name, "PaymentGatewayError"); assert_eq!(sym(&f, "PaymentGatewayError").bases, ["Exception"]);
+  assert_eq!(sym(&f, "on_value_error").handles_exception, Some(("ValueError".into(), Some(422)))); }
+#[test] fn except_tuple_and_bare() { /* `except (A, B) as e: pass` → types [A, B], Swallow (as_pattern wrapping tuple); bare `except:` → types [] */ }
+#[test] fn queue_ops_detected() { let pay = sym(&parse_file(Lang::Python, MAIN_PY), "pay"); assert_eq!((pay.queue_ops[0].queue.as_deref(), pay.queue_ops[0].op, pay.queue_ops[0].flavor), (Some("jobs:pay"), QueueDir::Send, Flavor::RedisList));
+  let ro = sym(&parse_file(Lang::Python, MAIN_PY), "refund_order"); assert_eq!(ro.queue_ops[0].task_ref.as_deref(), Some("refund")); assert!(ro.queue_ops[0].queue.is_none());
+  let w = parse_file(Lang::Python, WORKER_PY); assert_eq!(sym(&w, "run").queue_ops[0].op, QueueDir::Receive);
+  let t = sym(&w, "refund"); assert_eq!(t.task.as_ref().unwrap().name, "orders.refund"); assert_eq!(t.task.as_ref().unwrap().autoretry_for, ["TimeoutError"]);
+  /* f-string key f"jobs:{tenant}" → queue "jobs:{}"; non-literal key → no op */ }
+#[test] fn db_ops_detected() { let f = parse_file(Lang::Python, MAIN_PY);
+  assert!(sym(&f, "pay").db_ops.iter().any(|d| d.table.as_deref() == Some("payments") && d.access == Access::Write && d.via == Via::Sql));
+  assert!(sym(&f, "charge").db_ops.iter().any(|d| d.model.as_deref() == Some("Order") && d.access == Access::Read && d.via == Via::Orm));
+  assert_eq!(sym(&parse_file(Lang::Python, MODELS_PY), "Order").table.as_deref(), Some("orders"));
+  /* "SELECT o.id FROM public.orders o JOIN payments p ON …" → reads public.orders and payments; a string that isn't SQL → none */ }
 #[test] fn body_hash_ignores_formatting_and_comments() { let a = sym(&parse_file(Lang::Python, "def f(x):\n    return x + 1\n"), "f").body_hash.clone();
   let b = sym(&parse_file(Lang::Python, "def f(x):  # c\n\n    return   x + 1\n"), "f").body_hash.clone();
   let c = sym(&parse_file(Lang::Python, "def f(x):\n    return x + 2\n"), "f").body_hash.clone(); assert_eq!(a, b); assert_ne!(a, c); }
@@ -334,6 +361,12 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - **HTTP calls:** `httpx|requests|client|session` `.get|post|put|patch|delete(...)` whose first arg is a string or f-string.
   - **Env reads:** `os.getenv("X")`, `os.environ["X"]`, `os.environ.get("X")`, and annotated fields of a class that subclasses `BaseSettings` (uppercased). A read with a default (a second arg, or a field with `= value`) is recorded as `"X?"`.
   - **Entrypoint:** functions called inside `if __name__ == "__main__":`, a function named `main`, and any function carrying a route.
+  - **Flow facts** (flow design §1.1, §3.1, §4.1):
+    - Raises come from `raise_statement`.
+    - Handlers come from `try_statement` → `except_clause`. With `as`, the types sit inside `as_pattern` (a `tuple` for several), as verified with tree-sitter-python 0.25.
+    - `bases` come from `class_definition.superclasses`.
+    - Queue, task, SQL and ORM patterns are exactly the tables in the flow design.
+    - Calls record their line.
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit.** `git commit -am "feat(engine): python extractor (fastapi, worker)"`
 
@@ -363,6 +396,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 #[test] fn css_selectors() { assert_eq!(parse_file(Lang::Css, ".pay { color: red } #x .y:hover {}").css_selectors, [".pay", "#x .y:hover"]); }
 #[test] fn ts_interfaces_are_schemas() { let f = parse_file(Lang::TypeScript, "export interface PayRequest { amount: number }\nexport type Id = string;\nclass S { pay(b: PayRequest): Observable<Order> {} }");
   assert_eq!(sym(&f, "PayRequest").kind, SymbolKind::Schema); assert_eq!(sym(&f, "pay").uses_types, ["PayRequest", "Order"]); }
+#[test] fn ts_throw_and_catch() { /* `try { g(); } catch (e) { throw new PayError('x'); }` → handlers[0].types == [] with Reraise, reraise_as PayError, raises[0].type_name == "PayError"; `this.http.get('/a').pipe(catchError(...))` → a handler whose try range covers that call line, action Return */ }
 #[test] fn ts_jsdoc_and_hash() { /* `/** Pays the order. */ pay(id) {...}` → doc "Pays the order."; reformatting the body keeps body_hash */ }
 #[test] fn ts_env_reads() { /* environment.apiUrl → env_reads ["environment.apiUrl"]; process.env.FOO → ["FOO"] */ }
 ```
@@ -375,6 +409,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - Constructor parameters with a type annotation, plus `inject(X)`, fill `injects`.
   - **TS HTTP calls:** `this.http.<verb>(arg)` or `<anything named http|httpClient>.<verb>`, where `arg` is a template string or string literal. Run the path through `normalize_path`.
   - **TS logs:** `console.error|warn|info|log|debug` (`log` → `info`) and `this.logger.<level>`.
+  - **TS flow facts:** `throw_statement` with `new_expression` gives raises. `try_statement`/`catch_clause` gives handlers with `types: []`. A `catchError(...)` inside `.pipe(...)` gives a handler covering the piped call's line. Class `extends` gives `bases`. Calls record their line.
   - **HTML:** attributes named `(event)` whose value starts with an identifier followed by `(` give a binding. Tag names containing `-` give `elements`.
   - **CSS:** `rule_set` selectors text, whitespace-collapsed.
 - [ ] **Step 4: Run.** Expected: PASS.
@@ -433,13 +468,20 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `graph::FileGraph { nodes: Vec<Node>, edges: Vec<Edge> }`. Edges are file-local only: `CONTAINS DEFINES HAS_METHOD LOGS READS_ENV HANDLED_BY`.
   - `graph::file_graph(ctx: &Ctx, unit: &str /* service or lib name */, relpath: &str, src: &str, chunks: &ChunkParams) -> Result<FileGraph, SkipReason>`. `Err` when the file is skipped. Size and minified checks happen before parsing, using `indexing::limit_for`. It also emits `:Chunk` nodes (`chunk:{sym_id}:{ord}`, `layer: "structural"`, with `ord`, `start_line`, `end_line`, a redacted `text`, `text_hash`, `tokens_est`) and `CHUNK_OF` edges for every symbol with a card. A truncated symbol gets `chunks_truncated: true`.
   - `graph::workspace_graph(ctx: &Ctx) -> Result<Graph>`: Service/Datastore/EnvVar/Contract/Endpoint/Schema-from-OpenAPI nodes, plus docker edges (DEPENDS_ON CONNECTS_TO SHARES_VOLUME SETS_ENV USES_DATASTORE PROVIDES DECLARES DEFINES_SCHEMA). No per-file parsing.
-  - `graph::LINK_RELS: &[&str] = &["CALLS","CALLS_API","USES_SCHEMA","IMPLEMENTED_BY","INJECTS","TEMPLATE_BINDS","USES_LIB","CONSUMES","BOUNDARY"]`
-  - `graph::link(ctx: &Ctx, nodes: &[Node], workspace_edges: &[Edge]) -> (Vec<Edge>, usize /* unresolved calls */)`: computes every LINK_RELS edge from node properties (`calls`, `http_calls`, `uses_types`, `injects`, `template_url`, `imports` on File, `routes`, `qualname`, `unit`) plus `workspace_edges` (`DEPENDS_ON`, `CONNECTS_TO`, `SHARES_VOLUME` and `PROVIDES`, needed for `BOUNDARY` and `CONSUMES`). It never reads files. `BOUNDARY` is computed last, from the other link edges and `workspace_edges`.
+  - `graph::LINK_RELS: &[&str] = &["CALLS","CALLS_API","USES_SCHEMA","IMPLEMENTED_BY","INJECTS","TEMPLATE_BINDS","USES_LIB","CONSUMES","SENDS_TO","RECEIVES_FROM","READS_TABLE","WRITES_TABLE","MAPS_TO","ON","BOUNDARY"]` and `graph::LINK_LABELS: &[&str] = &["Queue","Table"]``
+  - `graph::LinkOutput { nodes: Vec<Node> /* Queue and Table */, edges: Vec<Edge>, unresolved_calls: usize, unresolved_queue_ops: usize }`
+  - `graph::link(ctx: &Ctx, nodes: &[Node], workspace_edges: &[Edge]) -> LinkOutput`: computes the LINK_LABELS nodes (`queue:{flavor}:{name}`, `table:{datastore|_}:{schema.}name`, per flow design §3.2 and §4.2) and every LINK_RELS edge.
+    - `CALLS` edges carry `lines: [..]`.
+    - **Celery sends:** `task_ref` resolves against a **workspace-wide** index of `task.name` and task function names, not through service-scoped call resolution. The task may live in another service.
+    - **ORM access:** `DbOp.model` resolves to a class with `table` through the normal order (same file, same service, used libs).
+    - **Table ids** use the accessing service's single Postgres datastore, else `_`. A library model's `MAPS_TO` points at the table node of each service that references it, so one table is one node.
+    - `BOUNDARY.via` adds `queue` (producer service → consumer service) and `table` (two services touching one table).
+    - Inputs: `queue_ops`, `db_ops`, `table` and `task`, plus from node properties (`calls`, `http_calls`, `uses_types`, `injects`, `template_url`, `imports` on File, `routes`, `qualname`, `unit`) plus `workspace_edges` (`DEPENDS_ON`, `CONNECTS_TO`, `SHARES_VOLUME` and `PROVIDES`, needed for `BOUNDARY` and `CONSUMES`). It never reads files. `BOUNDARY` is computed last, from the other link edges and `workspace_edges`.
   - `graph::build(ctx: &Ctx) -> Result<Graph>`: `workspace_graph` + every `file_graph` + `link`, with `ChunkParams::resolve(cfg, None, false)`. Used by `--dry-run` and tests, so dry-run chunk counts are provisional (256-token budget). `store::index` calls `file_graph` itself, with the resolved params.
   - `graph::card(node: &Node) -> Option<String>`: the card **header** for Function/Class/Component/Injectable/Schema/Route: kind, qualname, signature, doc, decorators/route, log templates, file path, joined by newlines and capped at 1 KiB. `None` for other labels. Every chunk of the symbol starts with this header.
   - Labels and rels are exactly those in the spec's graph model. In full:
-    - Labels: `Service Datastore File Function Class Component Injectable Schema LogStatement Route EnvVar Contract Endpoint Chunk`.
-    - Rels: `CHUNK_OF DEPENDS_ON CONNECTS_TO SHARES_VOLUME USES_LIB USES_DATASTORE CONTAINS DEFINES HAS_METHOD CALLS LOGS HANDLED_BY CALLS_API INJECTS TEMPLATE_BINDS READS_ENV SETS_ENV PROVIDES CONSUMES DECLARES IMPLEMENTED_BY DEFINES_SCHEMA USES_SCHEMA BOUNDARY`.
+    - Labels: `Service Datastore File Function Class Component Injectable Schema LogStatement Route EnvVar Contract Endpoint Chunk Queue Table`.
+    - Rels: `SENDS_TO RECEIVES_FROM READS_TABLE WRITES_TABLE MAPS_TO ON CHUNK_OF DEPENDS_ON CONNECTS_TO SHARES_VOLUME USES_LIB USES_DATASTORE CONTAINS DEFINES HAS_METHOD CALLS LOGS HANDLED_BY CALLS_API INJECTS TEMPLATE_BINDS READS_ENV SETS_ENV PROVIDES CONSUMES DECLARES IMPLEMENTED_BY DEFINES_SCHEMA USES_SCHEMA BOUNDARY`.
     - Every node gets `props.workspace = ctx.config.workspace.name`.
   - **Node ids:**
     - `svc:{name}`, `ds:{name}`, `env:{NAME}`
@@ -461,6 +503,13 @@ The workspace setup below is already in the repo; only check it. The compose cha
   assert!(has_edge(&g, "CALLS", &pay, &charge)); assert!(has_edge(&g, "CALLS", &pay, &id_of(&g, "Function", "get_db"))); // cross-service into lib
   assert!(has_edge(&g, "HANDLED_BY", "route:orders:POST:/api/orders/{order_id}/pay", &pay));
   assert!(has_edge(&g, "READS_ENV", &charge, "env:PAYMENT_GATEWAY_URL")); assert!(has_edge(&g, "SETS_ENV", "svc:orders", "env:DATABASE_URL")); }
+#[test] fn queue_and_table_edges() { let g = build(&ctx()).unwrap(); let q = "queue:redis_list:jobs:pay";
+  assert!(has_edge(&g, "SENDS_TO", &id_of(&g, "Function", "pay"), q) && has_edge(&g, "RECEIVES_FROM", &id_of(&g, "Function", "run"), q));
+  assert!(has_edge(&g, "SENDS_TO", &id_of(&g, "Function", "refund_order"), "queue:celery:orders.refund") && has_edge(&g, "RECEIVES_FROM", &id_of(&g, "Function", "refund"), "queue:celery:orders.refund"));
+  assert!(has_edge(&g, "WRITES_TABLE", &id_of(&g, "Function", "pay"), "table:db:payments") && has_edge(&g, "MAPS_TO", &id_of(&g, "Class", "Order"), "table:db:orders"));
+  assert!(has_edge(&g, "READS_TABLE", &id_of(&g, "Function", "charge"), "table:db:orders"));
+  assert!(via(edge(&g, "BOUNDARY", "svc:orders", "svc:worker").unwrap()).contains(&"queue"));
+  assert!(edge_props(&g, "CALLS", &id_of(&g, "Function", "pay"), &id_of(&g, "Function", "charge"))["lines"].as_array().unwrap().len() == 1); }
 #[test] fn frontend_to_backend() { let g = build(&ctx()).unwrap();
   assert!(has_edge(&g, "CALLS_API", &id_of(&g, "Function", "pay@OrdersService"), "route:orders:POST:/api/orders/{order_id}/pay"));
   assert!(has_edge(&g, "INJECTS", &id_of(&g, "Component", "OrdersComponent"), &id_of(&g, "Injectable", "OrdersService")));
@@ -475,7 +524,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   let b = edge(&g, "BOUNDARY", "svc:frontend", "svc:orders").unwrap(); assert!(via(b).contains(&"http") && via(b).contains(&"contract"));
   let b = edge(&g, "BOUNDARY", "svc:orders", "svc:worker").unwrap(); assert!(via(b).contains(&"compose") && via(b).contains(&"shared_lib")); }
 #[test] fn ids_have_no_lines() { let g = build(&ctx()).unwrap(); assert!(g.nodes.iter().filter(|n| n.id.starts_with("sym:")).all(|n| !n.id.rsplit(':').next().unwrap().chars().all(|c| c.is_ascii_digit()))); }
-#[test] fn link_from_props_matches_build() { let g = build(&ctx()).unwrap(); let ws: Vec<_> = g.edges.iter().filter(|e| !LINK_RELS.contains(&e.rel)).cloned().collect(); let (mut l, _) = link(&ctx(), &g.nodes, &ws);
+#[test] fn link_from_props_matches_build() { let g = build(&ctx()).unwrap(); let ws: Vec<_> = g.edges.iter().filter(|e| !LINK_RELS.contains(&e.rel)).cloned().collect(); let mut l = link(&ctx(), &g.nodes, &ws).edges;
   let mut b: Vec<_> = g.edges.iter().filter(|e| LINK_RELS.contains(&e.rel)).cloned().collect(); l.sort_by(|a,b| key(a).cmp(&key(b))); b.sort_by(|a,b| key(a).cmp(&key(b))); assert_eq!(keys(&l), keys(&b)); }
 #[test] fn card_contents() { let g = build(&ctx()).unwrap(); let c = card(node(&g, &id_of(&g, "Function", "pay"))).unwrap();
   assert!(c.contains("POST /api/orders/{order_id}/pay") && c.contains("payment failed for order %s") && c.contains("app/main.py")); }
@@ -549,7 +598,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
        - c. Workspace graph: MERGE its nodes (`SET n += r`, same rule). Delete structural nodes of labels Service/Datastore/EnvVar/Contract/Endpoint/Schema(openapi) that it no longer produces. Replace its edges.
        - d. **Before deleting** the vanished nodes: `MATCH (k:Knowledge)-[r]->(n)` over the vanished `(label, id)` pairs → `VanishedAnchor`s. Then `DETACH DELETE` those nodes, matching `layer:'structural'`.
        - d2. **Still inside the transaction**, after step e: `semantic::reattach_vanished(tx, &vanished)` (Task 7d). It re-attaches by qualname or records orphans, so a crash can never leave anchors cut while entries still read `current`. Until Task 7d lands, this is a no-op that returns the list unchanged.
-       - e. Relink: delete every edge whose type is in LINK_RELS within the workspace. Load all symbol, route and file nodes (props only) and the workspace edges (`DEPENDS_ON CONNECTS_TO SHARES_VOLUME PROVIDES`), run `graph::link(ctx, nodes, edges)`, and create the result.
+       - e. Relink: delete every edge whose type is in LINK_RELS within the workspace. Load all symbol, route and file nodes (props only) and the workspace edges (`DEPENDS_ON CONNECTS_TO SHARES_VOLUME PROVIDES`), run `graph::link(ctx, nodes, edges)`. MERGE its Queue/Table nodes (`SET n += r`); for link nodes no longer produced (by `(label, id)`), collect their incoming semantic anchors exactly as in step d, add them to `vanished`, then delete them. Then create its edges.
        - f. Write `(:IndexRun {id, started_at, finished_at, mode, files_added, files_changed, files_deleted, parse_fingerprint, embed_fingerprint, git_head, workspace, layer:'structural'})`. Keep the newest 20.
     5. **Commit.** On any error, roll back. The previous graph stays intact.
 

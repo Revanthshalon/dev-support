@@ -42,7 +42,8 @@ onto the code flow, checks configuration, and inspects datastores read-only.
 |---|---|
 | Languages | Python, TypeScript, JavaScript, HTML, CSS |
 | Frameworks | FastAPI, Python workers (binaries / background jobs), Angular |
-| Infrastructure | Dockerfile, docker compose, Kubernetes (logs and pod status through `kubectl`, namespace allow-list) |
+| Infrastructure | Dockerfile, docker compose, Kubernetes (logs, pod status and rollout history through `kubectl`, namespace allow-list) |
+| Execution flow | Static error paths (raise → handler → HTTP status or job outcome), async queue hops (Redis lists, streams, pub/sub, Celery, RQ), table access (SQL literals, SQLAlchemy), cross-service request timelines from logs, recent git changes |
 | Contracts | OpenAPI 3.x documents; schema libraries (pydantic `BaseModel`, TS `interface`/`type`) |
 | Datastores | PostgreSQL, Redis |
 | Graph store | Memgraph (through `rsmgclient`) |
@@ -289,6 +290,7 @@ To use several modes, register the server several times.
 | Data | `db_query`, `db_schema`, `redis_command`, `datastore_health` |
 | Semantic layer | `remember`, `revise`, `retract`, `recall`, `knowledge_gaps`, `search_code` |
 | Index and incidents | `reindex`, `save_incident_report`, `find_incident_reports` |
+| Execution flow and change | `error_paths`, `request_timeline`, `recent_changes`; `service_map(focus=…)` for blast radius |
 
 Agent prompts: `diagnose`, `triage_logs`, `explain_flow`, `check_misconfiguration`,
 `investigate_datastore`, `write_rca`, `enrich_knowledge`. `write_rca` produces an incident report from
