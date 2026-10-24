@@ -466,10 +466,14 @@ semantic:
 
 ### 4.6 Client integration
 - Both clients connect to the same stdio server through **one file**: `ops init` writes `.mcp.json` at
-  the workspace root (`{"mcpServers": {"ops": {...}}}`). Claude Code reads it, and so does Copilot CLI,
-  which loads project-level `.mcp.json` from the working directory up to the repository root
-  (GitHub Docs, "Adding MCP servers for GitHub Copilot CLI"). `ops init` never edits the user-level
-  `~/.copilot/mcp-config.json`.
+  the workspace root (`{"mcpServers": {"ops": {"type": "stdio", "command": "ops-mcp", "args": ["--mode", "operational-support"]}}}`).
+  - Claude Code reads it.
+  - Copilot CLI is **documented** to read project-level `.mcp.json` (from the working directory up to
+    the repository root, with the `mcpServers` wrapper; `tools` defaults to all). See GitHub Docs,
+    "Adding MCP servers for GitHub Copilot CLI". This is still to be confirmed by hand (Part 2 Task 14).
+  - Neither client documents the server's working directory, so the entry has no `--root`. `ops-mcp`
+    walks up from its working directory to `ops.yaml`, or uses `OPS_ROOT`.
+  - `ops init` never edits the user-level `~/.copilot/mcp-config.json`.
 - `author_client` comes from MCP `initialize.clientInfo.name`, normalized (`claude-code`,
   `copilot-cli`, else the raw name). `author_model` is an optional tool argument.
 - Optional: `ops init --agent-instructions` appends a short block to `AGENTS.md` / `CLAUDE.md`

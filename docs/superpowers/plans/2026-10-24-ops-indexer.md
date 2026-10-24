@@ -70,7 +70,13 @@ The workspace setup below is already in the repo; only check it. The compose cha
     1. `docker compose --profile embeddings up -d`. `docker compose logs embeddings-warmup` shows the model info, and the service exits 0.
     2. `docker compose down && docker compose up -d`. Data created before the restart (`CREATE (:Probe {x:1})`) is still there.
     3. `docker/memgraph/lib/hf-cache` contains the model.
-- [ ] **Step 5: Commit.** `git commit -am "chore: memgraph bind mount, recovery, embeddings warmup and gpu override"`
+- [ ] **Step 5: CI job for the Memgraph-backed tests.** Add an `integration` job to `.github/workflows/ci.yml`:
+  - A `services: memgraph: image: memgraph/memgraph-mage:3.14.0` container with ports `7687:7687` and `MEMGRAPH_USER`/`MEMGRAPH_PASSWORD` env.
+  - It waits for Bolt, then runs `cargo test --workspace -- --ignored --skip embed --skip semantic_search` (the core promises: incremental, reconcile, crash and lock tests).
+  - A second step, gated by `if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'embeddings')`, runs the embedding and search tests. It caches `~/.cache/huggingface` and sets `HF_HOME` in the service.
+
+  Ignored tests must not depend on anything else, such as Postgres or pyright: those keep their own name filters (`pg_`, `pyright_`) and stay manual.
+- [ ] **Step 6: Commit.** `git commit -am "chore: memgraph bind mount, recovery, embeddings warmup, gpu override, integration CI"`
 
 ---
 
@@ -261,7 +267,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - **Workspace kind:** one unit → `single`; one `.git` at root or none → `monorepo`; several `.git` dirs → `multi-repo`.
   - **LSP defaults:** python `[pyright-langserver, --stdio]`; ts/js `[typescript-language-server, --stdio]`.
   - **Logs default:** `compose` when linked, else none. When `kubectl config current-context` succeeds, write a commented-out `kubernetes:` example in the header comment, not live config.
-  - **`.mcp.json`:** `{"mcpServers":{"ops":{"command":"ops-mcp","args":["--root",".","--mode","operational-support"]}}}`.
+  - **`.mcp.json`:** `{"mcpServers":{"ops":{"type":"stdio","command":"ops-mcp","args":["--mode","operational-support"]}}}`. It has no `--root`, because neither client documents the server's working directory; `ops-mcp` finds the workspace by walking up to `ops.yaml` (see Part 2 Task 8). Claude Code and Copilot CLI both read this file.
   - **`.gitignore`:** append `.env` if a `.gitignore` exists and lacks it.
   - Sort services and datastores by name.
 - [ ] **Step 4: Add the CLI subcommand.** `ops init [--root DIR] [--force]` prints each written path, then: "edit ops.yaml, copy .env.example to .env, run `ops check`".
@@ -641,16 +647,16 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `embed::ModelInfo { dimension: usize, remote_provider: Option<String>, max_sequence_length: Option<usize> }`, and `embed::model_info(ctx) -> Result<ModelInfo>` via `CALL embeddings.model_info($cfg)`.
   - `enum EmbedStatus { Vector(ModelInfo), TextOnly(String /* reason */) }`, and `embed::status(ctx) -> EmbedStatus`. Gives `TextOnly` when `enabled` is false, the `embeddings` module is absent (`CALL mg.procedures()` has no `embeddings.text`), or `model_info` fails.
   - `embed::embed_texts(ctx, texts: &[String], kind: InputKind) -> Result<Vec<Vec<f32>>>` via `CALL embeddings.text($texts, $cfg)`, in chunks of 256.
-  - `embed::ensure_search_indexes(ctx, info: Option<&ModelInfo>, rebuild_vectors: bool) -> Result<()>`. Autocommit.
+  - `embed::ensure_search_indexes(ctx, info: Option<&ModelInfo>, rebuild_index: bool) -> Result<()>`. Autocommit.
     - Text indexes: `knowledge_text ON :Knowledge(title, body)`, `chunk_text ON :Chunk(text)`, and `card_text_<label> ON :<Label>(card)` per code label. The grammar takes one label plus an optional property list.
     - Vector index, when `info` is Some: a single `chunk_vec ON :Chunk(embedding)`, with `{dimension, capacity: max(1024, 2 × chunk count), metric, scalar_kind}`. There are no per-symbol or per-entry vectors.
-    - `rebuild_vectors` drops them first.
+    - `rebuild_index` drops and recreates the vector index. Dropping moves the stored vectors back into the property store (Memgraph docs), so recreating re-indexes the existing `embedding` properties **without** re-embedding.
   - **In `store::index`**, after relink and outside the main transaction (vector indexes are READ_UNCOMMITTED):
-    - **`embed_fingerprint`** = sha256 of `model`, `dimensions`, `metric` and `scalar_kind`. A change sets `rebuild_vectors` and re-embeds everything, including `:Knowledge`. It does **not** trigger a re-parse.
+    - **`embed_fingerprint`** = sha256 of `model`, `dimensions`, `metric` and `scalar_kind`. A change sets `rebuild_index` **and** `reembed_all`, so it re-embeds everything, including `:Knowledge`. It does **not** trigger a re-parse.
     - **Resolve chunk parameters** with `ChunkParams::resolve(cfg, info.max_sequence_length, info.remote_provider.is_some())` **before** parsing. Pass them to `file_graph`; they're in `parse_fingerprint`.
     - **No flapping:** `IndexRun` stores the resolved `max_tokens`. When `model_info` is unavailable (transient error, text-only run), `Auto` reuses the last run's stored value instead of the 256 fallback, so a hiccup never forces a full re-parse. The fallback applies only when no run has stored a value yet.
-    - **Re-embed only what changed:** `:Chunk` nodes with no `embedding`, or whose `text_hash` differs from their `embedded_hash`, plus every chunk when `rebuild_vectors` is set. `SET c.embedding = $vec, c.embedded_hash = c.text_hash`.
-    - **`--full`** always sets `rebuild_vectors`, because deleted nodes don't free vector-index memory until the index is dropped.
+    - **Re-embed only what changed:** `:Chunk` nodes with no `embedding`, or whose `text_hash` differs from their `embedded_hash`, plus every chunk when `reembed_all` is set. `SET c.embedding = $vec, c.embedded_hash = c.text_hash`. Re-embedding has exactly two triggers: a changed `embed_fingerprint`, or a changed chunk `text_hash`. A Full run never re-embeds by itself, which matters for paid remote models.
+    - **`--full`** always sets `rebuild_index` (but not `reembed_all`), because deleted nodes don't free vector-index memory until the index is dropped.
     - **`TextOnly`:** skip embedding, and record the reason in `IndexReport.embedding: String`.
   - `ops check` prints `embeddings: vector (local all-MiniLM-L6-v2, dim 384)`, or `remote openai, dim 1536`, or `text-only: <reason>`. It also warns when `SHOW VECTOR INDEX INFO` reports more than 2× as many vectors as live nodes.
 
@@ -662,6 +668,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 #[test] #[ignore] fn embeds_chunks_default_model() { /* MAGE image: index fixture → every :Chunk has `embedding` of length 384 and ChunkParams.max_tokens resolved to 256 (all-MiniLM-L6-v2's max_sequence_length);
   second incremental run re-embeds 0; editing one statement in `reconcile_refunds` re-embeds no chunk that lies wholly before that statement. Greedy packing may shift every later boundary, so later chunks can re-embed; that's expected. */ }
 #[test] #[ignore] fn long_function_found_by_its_tail() { /* fixture function of ~200 lines whose last block mentions "refund ledger"; search over chunk_vec for "refund ledger reconciliation" ranks that function first (Part 2 search uses the same query) */ }
+#[test] #[ignore] fn full_run_reembeds_nothing() { /* index (embeds all) → `ops index --full` with the same model → report.embedded == 0 and every chunk still has its embedding; vector search still returns hits */ }
 #[test] #[ignore] fn model_info_failure_does_not_reparse() { /* index once (max_tokens resolved 256 from the model); make model_info fail (test hook) → next incremental run: fingerprint_changed false, changed == 0, warning about text-only */ }
 #[test] #[ignore] fn model_change_rebuilds() { /* change model to another local model with a different dim → vector index recreated with the new dimension; report.changed == 0 (no re-parse) */ }
 ```
