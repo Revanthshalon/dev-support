@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local secrets and environment (commit only the example)
+.env
+.env.*
+!.env.example
+
+# Local data from bind-mounted Docker volumes (memgraph now uses named volumes)
+/docker/
+
+# Logs
+*.log
+
+# Local code-intelligence indexes / tool caches
+.codegraph/
+.serena/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

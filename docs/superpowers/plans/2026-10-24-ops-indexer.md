@@ -6,7 +6,7 @@
 
 **Architecture:** All logic lives in the `engine` library. `cli` is a thin clap binary. Graph building is a pure function (`graph::build`) that returns nodes and edges, so it is tested without a database. `store` is the only module that talks to Memgraph (rsmgclient, synchronous, wrapped in `spawn_blocking`).
 
-**Tech Stack:** Rust 2024, clap 4.6 (derive), config 0.15 (yaml), serde, serde_yaml_ng 0.10, serde_json, regex, walkdir, shlex, tree-sitter 0.27 + tree-sitter-python 0.25, tree-sitter-typescript 0.23, tree-sitter-html 0.23, tree-sitter-css 0.25, rsmgclient 4.0, tokio, anyhow.
+**Tech Stack:** Rust 2024, clap 4.6 (derive), config 0.15 (yaml), serde, serde_norway 0.9, serde_json, regex, walkdir, shlex, tree-sitter 0.27 + tree-sitter-python 0.25, tree-sitter-typescript 0.23, tree-sitter-html 0.23, tree-sitter-css 0.25, rsmgclient 4.0, tokio, anyhow.
 
 **Spec:** `docs/superpowers/specs/2026-10-24-ops-support-design.md`
 
@@ -79,7 +79,7 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 
 - [ ] **Step 1: Write the failing tests** (in `config.rs` `mod tests` and `redact.rs` `mod tests`)
 ```rust
-#[test] fn parses_spec_example() { let c: Config = serde_yaml_ng::from_str(SPEC_YAML).unwrap();
+#[test] fn parses_spec_example() { let c: Config = serde_norway::from_str(SPEC_YAML).unwrap();
   assert_eq!(c.services[0].framework, Framework::Fastapi);
   assert!(matches!(c.datastores[1].url, Secret::Literal(_)));
   assert_eq!(c.kubernetes.unwrap().namespaces, vec!["shop"]); }
@@ -133,7 +133,7 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine docker`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
-  - Compose goes through `serde_yaml_ng::Value`; the schema is too loose for derive.
+  - Compose goes through `serde_norway::Value`; the schema is too loose for derive.
   - Sort `connections` output so tests are deterministic. The hostname regex is `(^|[/@=\s,])NAME(:\d+|/|$|\s|,)`.
   - Dockerfile: join `\` continuation lines. `ENV k=v k2=v2` and the legacy `ENV k v` forms. Shell-form CMD is split with `shlex`. A later CMD/ENTRYPOINT replaces an earlier one, and the last stage wins.
 - [ ] **Step 4: Run.** Expected: PASS.
@@ -331,7 +331,7 @@ Already in the repo when this plan starts. Don't redo it; only check it.
 #[test] fn rejects_non_openapi() { assert!(parse_openapi("services: {}").is_err()); }
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine contract`. Expected: FAIL.
-- [ ] **Step 3: Implement** with `serde_json::Value` / `serde_yaml_ng::Value`. No OpenAPI crate.
+- [ ] **Step 3: Implement** with `serde_json::Value` / `serde_norway::Value`. No OpenAPI crate.
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit.** `git commit -am "feat(engine): openapi contract parsing"`
 
