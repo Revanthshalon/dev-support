@@ -228,11 +228,45 @@ semantic:
     # vector index
     metric: cos
     scalar_kind: f32
+    # long symbols and entries are embedded as overlapping chunks; search scores the best chunk
+    chunking:
+      enabled: true            # false = one chunk per symbol, cut at max_tokens
+      max_tokens: auto         # auto = the model's max sequence length (all-MiniLM-L6-v2: 256)
+      remote_max_tokens: 512   # used for auto with remote models, which don't report one
+      overlap_tokens: 32
+      max_chunks_per_symbol: 32
+      strategy: syntax         # syntax (split at statements) | lines
+      aggregate: max           # max | mean_top2
 ```
 
 Changing `model`, `dimensions`, `metric` or `scalar_kind` rebuilds the vector indexes and
-re-embeds everything on the next `ops index`. `ops check` reports which path is active (local, or
+re-embeds everything on the next `ops index`. Changing the chunking settings re-chunks (re-parses)
+everything. `search_code` returns the matching line range inside long functions. `ops check` reports which path is active (local, or
 remote with the provider), the vector dimension, and any load or key error.
+
+## Indexing limits *(planned)*
+
+Files are never split for parsing; the parser needs the whole file. The size limit keeps
+generated noise out of the graph, and you can change it:
+
+```yaml
+indexing:
+  max_file_bytes: 1MiB          # B / KiB / MiB / GiB or bytes; 0 = no limit
+  skip_minified: true           # *.min.js / *.min.css and very long-lined files
+  overrides:                    # first matching glob wins
+    - { path: "services/legacy/**/*.py", max_file_bytes: 8MiB }
+    - { path: "**/generated/**", skip: true }
+```
+
+To set it right before a run, use `ops index --max-file-bytes 8MiB` or
+`OPS_INDEXING__MAX_FILE_BYTES=8MiB ops index`. The env var also works for `ops watch`.
+
+> [!NOTE]
+> The flag lasts **one run only**. The next run without it, including `ops watch`, goes back to
+> the configured limit and drops those files again. Knowledge attached to them is re-attached when
+> they return. For a lasting change, use an `overrides` entry or the env var. Raising the
+limit re-parses on the next run, so files that were skipped get picked up. `ops index` lists the
+largest skipped files with their reason; `--show-skipped` lists all of them.
 
 ## Modes
 

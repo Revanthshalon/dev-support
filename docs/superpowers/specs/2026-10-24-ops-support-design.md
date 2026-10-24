@@ -106,8 +106,12 @@ semantic:                                           # optional; full option list
   embeddings:
     enabled: true
     model: { env: EMBEDDINGS_MODEL, default: all-MiniLM-L6-v2 }   # "provider/model" = remote via LiteLLM
+    chunking: { enabled: true, max_tokens: auto, overlap_tokens: 32 }  # long symbols embedded in overlapping chunks
 incidents:
   dir: docs/incidents                               # where write_rca reports are saved
+indexing:                                           # optional; layer design §3.1
+  max_file_bytes: 1MiB                              # 0 = no limit; also --max-file-bytes / OPS_INDEXING__MAX_FILE_BYTES
+  overrides: [{ path: "services/legacy/**", max_file_bytes: 8MiB }]
 ```
 `ops init` also writes `.env.example` (every `env:` name referenced) and `.mcp.json`.
 
@@ -115,7 +119,9 @@ incidents:
 Every node carries `id` and `workspace`. Structural nodes (everything below) also carry
 `layer: "structural"`.
 - **Ids have no line numbers**, e.g. `sym:{service}:{path}:{qualname}`, so they're stable across edits.
-- Symbols carry `body_hash`, `card` (code-card text) and `embedding`.
+- Symbols carry `body_hash` and `card` (the code-card header). Their embeddings live on
+  `(:Chunk)-[:CHUNK_OF]->(symbol)` nodes (header plus a slice of the body), so long functions
+  stay searchable end to end.
 - Files carry their content `hash`.
 - `(:IndexRun)` records each run.
 
