@@ -26,8 +26,9 @@ binaries are thin layers over this crate.
   marks them `orphaned`.
 - **Config is the source of truth.** Every module takes a loaded `Ctx` (the `ops.yaml` config,
   the workspace root and `.env` values) rather than reading the environment itself.
-- **Secrets stay secret.** A credential is a literal or `{ env: NAME }`, never shows up in
-  `Debug` output, and anything leaving the crate as text passes through `redact`.
+- **Secrets stay secret.** A credential is a `secrecy::SecretString`: masked in `Debug`, read
+  only through `expose_secret()`, wiped on drop. Anything leaving the crate as text passes
+  through `redact`.
 - **Fail soft.** Unparseable or oversized files are counted and skipped, and an unreachable
   backend is an `Err`, never a panic.
 
@@ -35,7 +36,7 @@ binaries are thin layers over this crate.
 
 | Module | Responsibility | Plan task |
 |---|---|---|
-| `config` | `ops.yaml` schema (including `correlation` and `changes`), `Secret` resolution, `.env`, `OPS_*` overrides, `validate` | P1·1 |
+| `config` | `ops.yaml` schema (including `correlation` and `changes`), credentials as `SecretString`, `.env`, `OPS_*` overrides, `validate` | P1·1 |
 | `redact` | Masks secret-looking values and `user:pass@` in any text | P1·1 |
 | `docker` | docker compose (with anchors and merge keys) and Dockerfile parsing; service connectivity from env values | P1·2 |
 | `spans` | `file:line` spans for YAML/JSON keys (tree-sitter) | P1·2 |

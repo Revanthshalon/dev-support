@@ -1,6 +1,7 @@
 //! Masks secret-looking values in any text before it leaves the crate: tool output, errors, logs.
 
 use regex::Regex;
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 /// Keys whose value is secret: the key ends in one of these words (so `tokens_est` and `max_tokens`
@@ -12,9 +13,10 @@ const KEY: &str = r"\b([A-Za-z0-9_.-]*?(?:password|passwd|secret|token|api[_-]?k
 static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     let sep = r#"["']?\s*[:=]\s*"#;
     [
-        // scheme://user:PASS@host; greedy up to the last `@`, since raw `@` in passwords happens
+        // scheme://user:PASS@host; greedy up to the last `@`, since raw `@` in passwords happens.
+        // It stops at quotes and angle brackets, so it can't run across JSON strings or markup.
         (
-            r"(?i)\b([a-z][a-z0-9+.-]*://[^:/@\s]*:)[^\s/]+@".to_string(),
+            r#"(?i)\b([a-z][a-z0-9+.-]*://[^:/@\s"'<>]*:)[^\s/"'<>]+@"#.to_string(),
             "${1}***@",
         ),
         // Authorization: Bearer <token> / Basic <base64>
@@ -23,8 +25,10 @@ static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
             "${1}***",
         ),
         (r"(?i)\b(basic\s+)[A-Za-z0-9+/=]{6,}".to_string(), "${1}***"),
-        // provider tokens that show up without a key: OpenAI sk-…, Hugging Face hf_…
-        (r"\b(sk-|hf_)[A-Za-z0-9_-]{6,}".to_string(), "${1}***"),
+        // provider tokens that show up without a key, by their real shape, so identifiers like
+        // `hf_hub_download` survive: OpenAI sk-… (long), Hugging Face hf_ + 30+ alphanumerics
+        (r"\bsk-[A-Za-z0-9_-]{20,}".to_string(), "sk-***"),
+        (r"\bhf_[A-Za-z0-9]{30,}".to_string(), "hf_***"),
         // KEY: "value", KEY='value', KEY=value
         (format!(r#"(?i){KEY}{sep}")[^"]*""#), "${1}***\""),
         (format!(r#"(?i){KEY}{sep}')[^']*'"#), "${1}***'"),
@@ -39,7 +43,10 @@ static RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
 pub fn redact(text: &str) -> String {
     let mut out = text.to_string();
     for (re, rep) in RULES.iter() {
-        out = re.replace_all(&out, *rep).into_owned();
+        // Only allocate when a rule actually matched.
+        if let Cow::Owned(s) = re.replace_all(&out, *rep) {
+            out = s;
+        }
     }
     out
 }
@@ -73,8 +80,14 @@ mod tests {
             ("SENTRY_DSN=https://k@sentry.io/1", "https://k"),
             ("aws_credential: cred42", "cred42"),
             ("Authorization: Bearer eyJhbGciOi.payload", "eyJhbGciOi"),
-            ("token sk-proj-abcdef123456 rejected", "abcdef123456"),
-            ("hf_AbCdEfGhIjKlMnOp is invalid", "AbCdEfGhIjKlMnOp"),
+            (
+                "token sk-proj-abcdef1234567890abcdef rejected",
+                "abcdef123456",
+            ),
+            (
+                "hf_AbCdEfGhIjKlMnOpQrStUvWxYz012345 is invalid",
+                "AbCdEfGhIjKlMnOp",
+            ),
             ("redis://:pw-only@cache:6379/0", "pw-only"),
         ] {
             let out = redact(input);
@@ -101,6 +114,28 @@ mod tests {
             redact("postgres://u:p@ss@host/db"),
             "postgres://u:***@host/db"
         );
+    }
+
+    #[test]
+    fn url_rule_stays_inside_json_strings() {
+        let s = r#"{"a":"redis://:pw@cache:6379","b":"x@y.com"}"#;
+        assert_eq!(
+            redact(s),
+            r#"{"a":"redis://:***@cache:6379","b":"x@y.com"}"#
+        );
+    }
+
+    #[test]
+    fn identifiers_that_look_like_token_prefixes_survive() {
+        for s in [
+            "calling hf_hub_download",
+            "use sk-learn-style naming",
+            "task-runner sk-1",
+        ] {
+            assert_eq!(redact(s), s);
+        }
+        assert_eq!(redact("hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123456"), "hf_***");
+        assert_eq!(redact("sk-proj-abcdefghij0123456789"), "sk-***");
     }
 
     #[test]

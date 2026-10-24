@@ -1,9 +1,11 @@
 //! `ops.yaml`: the schema, loading (the file, `OPS_*` env overrides, `.env`), secrets and validation.
 //!
-//! A credential is a literal or `{ env: NAME }` ([`Secret`]); a setting can be either too
-//! ([`EnvOr`]). Env values come from the process first, then from `.env` at the workspace root.
+//! Credentials are quoted strings in `ops.yaml`, held as [`SecretString`] (see [`secret`]); the
+//! file is git-ignored because of them. A non-secret setting can be a literal or `{ env: NAME }`
+//! ([`EnvOr`]); env values come from the process first, then from `.env` at the workspace root.
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow};
+use secrecy::{ExposeSecret, SecretString};
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -75,54 +77,45 @@ where
     }
 }
 
-/// A credential: a literal, or `{ env: NAME }`. Its `Debug` never shows a literal value.
-#[derive(Clone, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum Secret {
-    Literal(String),
-    Env { env: String },
-}
+/// (De)serializing credential fields as [`SecretString`].
+///
+/// Only a quoted string is accepted: YAML reads an unquoted `0123` as the integer 123, and using
+/// that as a password would fail far from the cause. The error names the field (the deserializer
+/// adds the path) but never the value. `serialize` exposes the value, for writing `ops.yaml` only.
+pub mod secret {
+    use secrecy::{ExposeSecret, SecretString};
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use serde_json::Value;
 
-impl<'de> Deserialize<'de> for Secret {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+    const NOT_A_STRING: &str =
+        "a credential must be a quoted string (YAML reads an unquoted 0123 as the number 123)";
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SecretString, D::Error> {
         match Value::deserialize(d)? {
-            Value::String(s) => Ok(Secret::Literal(s)),
-            Value::Number(n) => Ok(Secret::Literal(n.to_string())),
-            Value::Bool(b) => Ok(Secret::Literal(b.to_string())),
-            Value::Object(m) => match m.get("env").and_then(Value::as_str) {
-                Some(env) => Ok(Secret::Env {
-                    env: env.to_string(),
-                }),
-                None => Err(D::Error::custom("a secret is a string or { env: NAME }")),
-            },
-            _ => Err(D::Error::custom("a secret is a string or { env: NAME }")),
-        }
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Secret::Literal(_) => write!(f, "Secret(***)"),
-            Secret::Env { env } => write!(f, "Secret(env={env})"),
-        }
-    }
-}
-
-impl Secret {
-    pub fn resolve(&self, ctx: &Ctx) -> Result<String> {
-        match self {
-            Secret::Literal(s) => Ok(s.clone()),
-            Secret::Env { env } => ctx.env(env).ok_or_else(|| {
-                anyhow!("environment variable {env} is not set (checked the process env and .env)")
-            }),
+            Value::String(s) => Ok(s.into()),
+            _ => Err(D::Error::custom(NOT_A_STRING)),
         }
     }
 
-    pub fn env_name(&self) -> Option<&str> {
-        match self {
-            Secret::Literal(_) => None,
-            Secret::Env { env } => Some(env),
+    pub fn deserialize_opt<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<SecretString>, D::Error> {
+        match Option::<Value>::deserialize(d)? {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.into())),
+            Some(_) => Err(D::Error::custom(NOT_A_STRING)),
+        }
+    }
+
+    pub fn serialize<S: Serializer>(v: &SecretString, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(v.expose_secret())
+    }
+
+    pub fn serialize_opt<S: Serializer>(v: &Option<SecretString>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => s.serialize_str(v.expose_secret()),
+            None => s.serialize_none(),
         }
     }
 }
@@ -131,41 +124,80 @@ impl Secret {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteSize(pub u64);
 
+/// The units a [`ByteSize`] can be written in (binary multiples).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeUnit {
+    B,
+    KiB,
+    MiB,
+    GiB,
+}
+
+impl SizeUnit {
+    /// Largest first, for display.
+    const ALL: [SizeUnit; 4] = [SizeUnit::GiB, SizeUnit::MiB, SizeUnit::KiB, SizeUnit::B];
+
+    pub fn bytes(self) -> u64 {
+        match self {
+            SizeUnit::B => 1,
+            SizeUnit::KiB => 1 << 10,
+            SizeUnit::MiB => 1 << 20,
+            SizeUnit::GiB => 1 << 30,
+        }
+    }
+}
+
+impl FromStr for SizeUnit {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "" | "B" => Ok(SizeUnit::B),
+            "KiB" => Ok(SizeUnit::KiB),
+            "MiB" => Ok(SizeUnit::MiB),
+            "GiB" => Ok(SizeUnit::GiB),
+            _ => Err(()),
+        }
+    }
+}
+
+impl fmt::Display for SizeUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            SizeUnit::B => "B",
+            SizeUnit::KiB => "KiB",
+            SizeUnit::MiB => "MiB",
+            SizeUnit::GiB => "GiB",
+        })
+    }
+}
+
 impl FromStr for ByteSize {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
+        let bad =
+            || format!("invalid size {s:?}: use a number of bytes or B, KiB, MiB, GiB (e.g. 8MiB)");
         let t = s.trim();
         let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
         let (num, unit) = t.split_at(split);
-        let mult: u64 = match unit.trim() {
-            "" | "B" => 1,
-            "KiB" => 1 << 10,
-            "MiB" => 1 << 20,
-            "GiB" => 1 << 30,
-            _ => 0,
-        };
-        let bad =
-            || format!("invalid size {s:?}: use a number of bytes or B, KiB, MiB, GiB (e.g. 8MiB)");
-        if num.is_empty() || mult == 0 {
-            return Err(bad());
-        }
+        let unit: SizeUnit = unit.trim().parse().map_err(|()| bad())?;
         num.parse::<u64>()
             .ok()
-            .and_then(|n| n.checked_mul(mult))
+            .and_then(|n| n.checked_mul(unit.bytes()))
             .map(ByteSize)
             .ok_or_else(bad)
     }
 }
 
 impl fmt::Display for ByteSize {
+    /// The largest unit that divides the size exactly: `8MiB`, `1536`, `0`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let n = self.0;
-        match n {
-            0 => write!(f, "0"),
-            _ if n.is_multiple_of(1 << 30) => write!(f, "{}GiB", n >> 30),
-            _ if n.is_multiple_of(1 << 20) => write!(f, "{}MiB", n >> 20),
-            _ if n.is_multiple_of(1 << 10) => write!(f, "{}KiB", n >> 10),
-            _ => write!(f, "{n}"),
+        match SizeUnit::ALL
+            .into_iter()
+            .find(|u| n > 0 && n.is_multiple_of(u.bytes()))
+        {
+            Some(SizeUnit::B) | None => write!(f, "{n}"),
+            Some(u) => write!(f, "{}{u}", n / u.bytes()),
         }
     }
 }
@@ -227,8 +259,15 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Workspace {
     pub name: String,
-    /// `single`, `monorepo` or `multi-repo`.
-    pub kind: String,
+    pub kind: WorkspaceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceKind {
+    Single,
+    Monorepo,
+    MultiRepo,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -236,10 +275,18 @@ pub struct Workspace {
 pub struct MemgraphCfg {
     pub host: String,
     pub port: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub username: Option<Secret>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub password: Option<Secret>,
+    #[serde(
+        deserialize_with = "secret::deserialize_opt",
+        serialize_with = "secret::serialize_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub username: Option<SecretString>,
+    #[serde(
+        deserialize_with = "secret::deserialize_opt",
+        serialize_with = "secret::serialize_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub password: Option<SecretString>,
 }
 
 impl Default for MemgraphCfg {
@@ -385,50 +432,44 @@ pub enum DatastoreKind {
 pub struct Datastore {
     pub name: String,
     pub kind: DatastoreKind,
-    pub url: Secret,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub password: Option<Secret>,
+    #[serde(
+        deserialize_with = "secret::deserialize",
+        serialize_with = "secret::serialize"
+    )]
+    pub url: SecretString,
+    #[serde(
+        default,
+        deserialize_with = "secret::deserialize_opt",
+        serialize_with = "secret::serialize_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub password: Option<SecretString>,
 }
+
+/// Everything except RFC 3986 unreserved characters (`A-Z a-z 0-9 - . _ ~`).
+const USERINFO: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 impl Datastore {
-    /// The URL with `password` (when set) put into its userinfo, percent-encoded.
-    pub fn connection_url(&self, ctx: &Ctx) -> Result<String> {
-        let url = self.url.resolve(ctx)?;
+    /// The URL with `password` (when set) put into its userinfo, percent-encoded by `url`.
+    pub fn connection_url(&self) -> Result<SecretString> {
         let Some(pw) = &self.password else {
-            return Ok(url);
+            return Ok(self.url.clone());
         };
-        let pw = percent_encode(&pw.resolve(ctx)?);
-        let Some(i) = url.find("://") else {
-            bail!("datastore {}: url has no scheme://", self.name)
-        };
-        let (scheme, rest) = url.split_at(i + 3);
-        let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-        let (user, host) = match authority.rfind('@') {
-            Some(at) => (
-                authority[..at].split(':').next().unwrap_or(""),
-                &authority[at + 1..],
-            ),
-            None => ("", authority),
-        };
-        Ok(format!("{scheme}{user}:{pw}@{host}{path}"))
+        // url::ParseError never includes the input, so the error can't leak the URL's credentials.
+        let mut url = url::Url::parse(self.url.expose_secret())
+            .map_err(|e| anyhow!("datastore {}: url is not a valid URL ({e})", self.name))?;
+        // set_password leaves `%` alone (it may be pre-encoded), so encode everything but the
+        // RFC 3986 unreserved characters first; a literal `%` then becomes `%25`.
+        let encoded =
+            percent_encoding::utf8_percent_encode(pw.expose_secret(), USERINFO).to_string();
+        url.set_password(Some(&encoded))
+            .map_err(|()| anyhow!("datastore {}: url can't hold a password", self.name))?;
+        Ok(url.to_string().into())
     }
-}
-
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '@' => out.push_str("%40"),
-            ':' => out.push_str("%3A"),
-            '/' => out.push_str("%2F"),
-            '%' => out.push_str("%25"),
-            '?' => out.push_str("%3F"),
-            '#' => out.push_str("%23"),
-            ' ' => out.push_str("%20"),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -498,7 +539,7 @@ pub struct EmbeddingsCfg {
     pub num_retries: EnvOr<u32>,
     pub normalize: EnvOr<bool>,
     pub remote_batch_size: Option<EnvOr<usize>>,
-    pub concurrency: EnvOr<usize>,
+    pub concurrency: EnvOr<Concurrency>,
     pub metric: EnvOr<String>,
     pub scalar_kind: EnvOr<String>,
     pub chunking: ChunkingCfg,
@@ -520,10 +561,36 @@ impl Default for EmbeddingsCfg {
             num_retries: EnvOr::Literal(3),
             normalize: EnvOr::Literal(true),
             remote_batch_size: None,
-            concurrency: EnvOr::Literal(4),
+            concurrency: EnvOr::Literal(Concurrency(4)),
             metric: EnvOr::Literal("cos".into()),
             scalar_kind: EnvOr::Literal("f32".into()),
             chunking: ChunkingCfg::default(),
+        }
+    }
+}
+
+/// Parallel embedding requests: 1–32, checked wherever the value comes from (literal or env).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Concurrency(pub usize);
+
+impl FromStr for Concurrency {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().parse::<usize>() {
+            Ok(n) if (1..=32).contains(&n) => Ok(Concurrency(n)),
+            _ => Err(format!("concurrency {s:?} must be a number 1–32")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Concurrency {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match Value::deserialize(d)? {
+            Value::Number(n) => n.to_string().parse().map_err(D::Error::custom),
+            Value::String(s) => s.parse().map_err(D::Error::custom),
+            other => Err(D::Error::custom(format!(
+                "concurrency {other} must be a number 1–32"
+            ))),
         }
     }
 }
@@ -544,7 +611,8 @@ impl<'de> Deserialize<'de> for MaxTokens {
             }),
             Value::Number(n) => n
                 .as_u64()
-                .map(|n| MaxTokens::N(n as usize))
+                .and_then(|n| usize::try_from(n).ok())
+                .map(MaxTokens::N)
                 .ok_or_else(|| D::Error::custom("max_tokens must be a positive number")),
             other => Err(D::Error::custom(format!(
                 "max_tokens: {other} is not `auto` or a number"
@@ -674,12 +742,13 @@ impl Default for IndexingCfg {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
+/// One `indexing.overrides` entry. `path` is required; the rest default.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Override {
     pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_file_bytes: Option<ByteSize>,
+    #[serde(default)]
     pub skip: bool,
 }
 
@@ -694,30 +763,56 @@ pub mod indexing {
         pub skip: bool,
     }
 
-    /// The limit for `relpath` (relative to the workspace root): the first matching override, else
-    /// `indexing.max_file_bytes`.
-    // ponytail: compiles the override globs on every call; build a GlobSet once if indexing shows it.
-    pub fn limit_for(ctx: &Ctx, relpath: &str) -> Result<Limit> {
-        let cfg = &ctx.config.indexing;
-        let limit = |b: u64| (b > 0).then_some(b);
-        for o in &cfg.overrides {
-            let glob = super::glob(&o.path)
-                .with_context(|| format!("indexing.overrides path {:?}", o.path))?;
-            if glob.is_match(relpath) {
-                let max = match o.max_file_bytes {
-                    Some(b) => b,
-                    None => ctx.setting(&cfg.max_file_bytes)?,
-                };
-                return Ok(Limit {
-                    max_bytes: limit(max.0),
-                    skip: o.skip,
-                });
-            }
+    /// The `indexing` section, ready to ask per file: globs compiled and `max_file_bytes` resolved
+    /// once. Build one per index run.
+    #[derive(Debug, Clone)]
+    pub struct Limits {
+        default: Option<u64>,
+        overrides: Vec<(globset::GlobMatcher, Limit)>,
+    }
+
+    impl Limits {
+        /// Fails on a bad glob or an unresolvable `max_file_bytes`.
+        pub fn new(ctx: &Ctx) -> Result<Limits> {
+            let cfg = &ctx.config.indexing;
+            let nonzero = |b: u64| (b > 0).then_some(b);
+            let default = ctx.setting(&cfg.max_file_bytes)?.0;
+            let overrides = cfg
+                .overrides
+                .iter()
+                .map(|o| {
+                    let glob = super::glob(&o.path)
+                        .with_context(|| format!("indexing.overrides path {:?}", o.path))?;
+                    let max = o.max_file_bytes.map_or(default, |b| b.0);
+                    Ok((
+                        glob,
+                        Limit {
+                            max_bytes: nonzero(max),
+                            skip: o.skip,
+                        },
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            Ok(Limits {
+                default: nonzero(default),
+                overrides,
+            })
         }
-        Ok(Limit {
-            max_bytes: limit(ctx.setting(&cfg.max_file_bytes)?.0),
-            skip: false,
-        })
+
+        /// The limit for `relpath` (relative to the workspace root): the first matching override,
+        /// else `indexing.max_file_bytes`.
+        pub fn for_path(&self, relpath: &str) -> Limit {
+            self.overrides
+                .iter()
+                .find(|(glob, _)| glob.is_match(relpath))
+                .map_or(
+                    Limit {
+                        max_bytes: self.default,
+                        skip: false,
+                    },
+                    |(_, l)| *l,
+                )
+        }
     }
 }
 
@@ -736,6 +831,8 @@ fn glob(pattern: &str) -> Result<globset::GlobMatcher, globset::Error> {
 #[derive(Clone)]
 pub struct Ctx {
     pub root: PathBuf,
+    /// The loaded config with `OPS_*` overrides merged in. Never write it back to `ops.yaml`:
+    /// that would save env-supplied values (credentials included) to disk.
     pub config: Config,
     process_env: HashMap<String, String>,
     dotenv: HashMap<String, String>,
@@ -777,7 +874,7 @@ impl Ctx {
                     .source(Some(ops_env)),
             )
             .build()
-            .and_then(|c| c.try_deserialize())
+            .and_then(config::Config::try_deserialize)
             .with_context(|| format!("loading {}", file.display()))?;
         let dotenv = match std::fs::read_to_string(root.join(".env")) {
             Ok(text) => parse_dotenv(&text),
@@ -912,14 +1009,38 @@ fn parse_dotenv(text: &str) -> HashMap<String, String> {
 // ---------------------------------------------------------------------------------------------
 // Validation
 
-/// Human-readable problems with `config`; empty when it's consistent.
+/// Human-readable problems with `config`; empty when it's consistent. Never includes a credential.
+#[must_use]
 pub fn validate(config: &Config) -> Vec<String> {
     let mut p = Vec::new();
-    if !["single", "monorepo", "multi-repo"].contains(&config.workspace.kind.as_str()) {
+    if config.version != 1 {
         p.push(format!(
-            "workspace.kind {:?} must be single, monorepo or multi-repo",
-            config.workspace.kind
+            "unsupported ops.yaml version {} (this ops reads version 1)",
+            config.version
         ));
+    }
+    let empty = |s: &SecretString| s.expose_secret().is_empty();
+    for (field, v) in [
+        ("username", &config.memgraph.username),
+        ("password", &config.memgraph.password),
+    ] {
+        if v.as_ref().is_some_and(empty) {
+            p.push(format!("memgraph.{field} is empty: fill it in ops.yaml"));
+        }
+    }
+    for d in &config.datastores {
+        if empty(&d.url) {
+            p.push(format!(
+                "datastore {}: url is empty: fill it in ops.yaml",
+                d.name
+            ));
+        }
+        if d.password.as_ref().is_some_and(empty) {
+            p.push(format!(
+                "datastore {}: password is empty: fill it in ops.yaml",
+                d.name
+            ));
+        }
     }
     let libs: Vec<&str> = config.shared_libs.iter().map(|l| l.name.as_str()).collect();
     let datastores: Vec<&str> = config.datastores.iter().map(|d| d.name.as_str()).collect();
@@ -963,11 +1084,6 @@ pub fn validate(config: &Config) -> Vec<String> {
         }
     }
     let e = &config.semantic.embeddings;
-    if let EnvOr::Literal(n) = e.concurrency
-        && !(1..=32).contains(&n)
-    {
-        p.push(format!("semantic.embeddings.concurrency {n} must be 1–32"));
-    }
     if let MaxTokens::N(n) = e.chunking.max_tokens
         && e.chunking.overlap_tokens >= n
     {
@@ -1020,8 +1136,9 @@ fn since_days(s: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::indexing::limit_for;
+    use super::indexing::Limits;
     use super::*;
+    use secrecy::ExposeSecret;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1049,6 +1166,7 @@ mod tests {
         d
     }
 
+    const NO_MEMGRAPH: &str = "version: 1\nworkspace: { name: shop, kind: monorepo }\n";
     const MINIMAL: &str = "version: 1\nworkspace: { name: shop, kind: monorepo }\nmemgraph: { host: localhost, port: 7687 }\n";
 
     /// A workspace in a temp dir with `ops.yaml` (and optionally `.env`), loaded with `env` as the process env.
@@ -1073,7 +1191,11 @@ mod tests {
     fn parses_spec_example() {
         let c: Config = serde_norway::from_str(&spec_yaml()).unwrap();
         assert_eq!(c.services[0].framework, Framework::Fastapi);
-        assert!(matches!(c.datastores[1].url, Secret::Literal(_)));
+        assert_eq!(
+            c.datastores[1].url.expose_secret(),
+            "redis://localhost:6379/0"
+        );
+        assert_eq!(c.workspace.kind, WorkspaceKind::Monorepo);
         assert_eq!(c.kubernetes.as_ref().unwrap().namespaces, vec!["shop"]);
         assert_eq!(c.correlation.clock_skew_ms, 500);
         assert_eq!(c.correlation.patterns.len(), 3); // partial section keeps the default patterns
@@ -1093,55 +1215,67 @@ mod tests {
     }
 
     #[test]
-    fn secret_missing_env_names_var() {
-        let err = Secret::Env {
-            env: "NOPE_X".into(),
-        }
-        .resolve(&ctx_tmp())
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("NOPE_X"), "{err}");
+    fn secret_must_be_a_quoted_string() {
+        // YAML reads an unquoted 0123 as the integer 123: refuse it instead of using the wrong credential.
+        let d = tmp_dir();
+        std::fs::write(
+            d.join("ops.yaml"),
+            format!("{NO_MEMGRAPH}memgraph: {{ password: 0987654 }}\n"),
+        )
+        .unwrap();
+        let err = format!("{:#}", Ctx::load_with_env(&d, HashMap::new()).unwrap_err());
+        assert!(
+            err.contains("memgraph.password") && err.contains("quoted"),
+            "{err}"
+        );
+        assert!(!err.contains("987654"), "{err}"); // the value never appears
+        // Quoted, and from an env override, it's taken verbatim.
+        let c = ctx_with(
+            &format!("{NO_MEMGRAPH}memgraph: {{ password: \"0123\" }}\n"),
+            None,
+            &[],
+        );
+        assert_eq!(
+            c.config.memgraph.password.as_ref().unwrap().expose_secret(),
+            "0123"
+        );
+    }
+
+    #[test]
+    fn empty_secret_named_by_field() {
+        let c = ctx_with(
+            &format!(
+                "{MINIMAL}datastores:\n  - {{ name: db, kind: postgres, url: \"\" }}\n  - {{ name: c, kind: redis, url: \"redis://c:6379/0\", password: \"\" }}\n"
+            ),
+            None,
+            &[],
+        );
+        let p = validate(&c.config);
+        assert!(
+            p.iter()
+                .any(|x| x.contains("datastore db") && x.contains("url")),
+            "{p:?}"
+        );
+        assert!(
+            p.iter()
+                .any(|x| x.contains("datastore c") && x.contains("password")),
+            "{p:?}"
+        );
     }
 
     #[test]
     fn secret_debug_hides_literal() {
-        assert!(!format!("{:?}", Secret::Literal("hunter2".into())).contains("hunter2"));
-        assert_eq!(
-            format!(
-                "{:?}",
-                Secret::Env {
-                    env: "DB_URL".into()
-                }
-            ),
-            "Secret(env=DB_URL)"
-        );
         let c = ctx_with(
             &format!(
-                "{MINIMAL}datastores:\n  - {{ name: db, kind: postgres, url: \"postgres://u:hunter2@db/x\" }}\n"
+                "{NO_MEMGRAPH}memgraph: {{ username: \"ops-user\", password: \"pw-hunter2\" }}\ndatastores:\n  - {{ name: db, kind: postgres, url: \"postgres://u:hunter2@db/x\", password: \"pw2-hunter2\" }}\n"
             ),
             None,
             &[],
         );
-        assert!(!format!("{:?}", c.config).contains("hunter2"));
-    }
-
-    #[test]
-    fn numeric_literal_secret_is_a_string() {
-        let c = ctx_with(
-            &format!(
-                "{MINIMAL}datastores:\n  - {{ name: c, kind: redis, url: \"redis://cache:6379/0\", password: 1234 }}\n"
-            ),
-            None,
-            &[],
-        );
-        assert_eq!(
-            c.config.datastores[0]
-                .password
-                .as_ref()
-                .unwrap()
-                .resolve(&c)
-                .unwrap(),
-            "1234"
+        let dbg = format!("{:?} {:?}", c.config, c);
+        assert!(
+            !dbg.contains("hunter2") && !dbg.contains("ops-user"),
+            "{dbg}"
         );
     }
 
@@ -1150,7 +1284,7 @@ mod tests {
         let c = ctx_tmp();
         let e = &c.config.semantic.embeddings;
         assert_eq!(c.setting(&e.model).unwrap(), "all-MiniLM-L6-v2");
-        assert_eq!(c.setting(&e.concurrency).unwrap(), 4);
+        assert_eq!(c.setting(&e.concurrency).unwrap(), Concurrency(4));
         assert_eq!(c.setting(&e.metric).unwrap(), "cos");
         assert!(c.setting(&e.enabled).unwrap());
         assert!(e.device.is_none() && e.api_base.is_none() && e.dimensions.is_none());
@@ -1192,17 +1326,23 @@ mod tests {
                 .contains("EMB_Y")
         );
 
+        // concurrency is 1–32 whether it's a literal or comes from an env var.
+        let d = tmp_dir();
+        std::fs::write(
+            d.join("ops.yaml"),
+            format!("{MINIMAL}semantic: {{ embeddings: {{ concurrency: 40 }} }}\n"),
+        )
+        .unwrap();
+        let err = format!("{:#}", Ctx::load_with_env(&d, HashMap::new()).unwrap_err());
+        assert!(err.contains("1–32"), "{err}");
         let c = ctx_with(
-            &format!("{MINIMAL}semantic: {{ embeddings: {{ concurrency: 40 }} }}\n"),
-            None,
+            &format!("{MINIMAL}semantic: {{ embeddings: {{ concurrency: {{ env: C }} }} }}\n"),
+            Some("C=0\n"),
             &[],
         );
         assert!(
-            validate(&c.config)
-                .iter()
-                .any(|p| p.contains("concurrency")),
-            "{:?}",
-            validate(&c.config)
+            c.setting(&c.config.semantic.embeddings.concurrency)
+                .is_err()
         );
     }
 
@@ -1278,13 +1418,14 @@ mod tests {
             None,
             &[],
         );
+        let limits = Limits::new(&c).unwrap();
         assert_eq!(
-            limit_for(&c, "services/legacy/a/x.py").unwrap().max_bytes,
+            limits.for_path("services/legacy/a/x.py").max_bytes,
             Some(8 << 20)
         );
-        assert!(limit_for(&c, "x/generated/y.ts").unwrap().skip);
+        assert!(limits.for_path("x/generated/y.ts").skip);
         assert_eq!(
-            limit_for(&c, "services/orders/app/main.py").unwrap(),
+            limits.for_path("services/orders/app/main.py"),
             indexing::Limit {
                 max_bytes: Some(1 << 20),
                 skip: false
@@ -1296,7 +1437,22 @@ mod tests {
             None,
             &[],
         );
-        assert_eq!(limit_for(&c, "a.py").unwrap().max_bytes, None);
+        assert_eq!(Limits::new(&c).unwrap().for_path("a.py").max_bytes, None);
+
+        // An override needs a path, and a bad glob fails when the limits are built.
+        let d = tmp_dir();
+        std::fs::write(
+            d.join("ops.yaml"),
+            format!("{MINIMAL}indexing: {{ overrides: [{{ skip: true }}] }}\n"),
+        )
+        .unwrap();
+        assert!(Ctx::load_with_env(&d, HashMap::new()).is_err());
+        let c = ctx_with(
+            &format!("{MINIMAL}indexing: {{ overrides: [{{ path: \"a[\" }}] }}\n"),
+            None,
+            &[],
+        );
+        assert!(Limits::new(&c).is_err());
     }
 
     #[test]
@@ -1427,13 +1583,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            c.config
-                .memgraph
-                .password
-                .as_ref()
-                .unwrap()
-                .resolve(&c)
-                .unwrap(),
+            c.config.memgraph.password.as_ref().unwrap().expose_secret(),
             "0123"
         );
         assert_eq!(c.config.memgraph.host, "10.0");
@@ -1464,7 +1614,7 @@ mod tests {
     fn lookups() {
         let c = ctx_with(
             &format!(
-                "{MINIMAL}shared_libs: [{{ name: common, path: libs/common, language: python }}]\nservices:\n  - {{ name: orders-api, path: services/orders, language: python, framework: fastapi, docker: {{ compose_service: orders }} }}\ndatastores:\n  - {{ name: db, kind: postgres, url: {{ env: DB_URL }} }}\n"
+                "{MINIMAL}shared_libs: [{{ name: common, path: libs/common, language: python }}]\nservices:\n  - {{ name: orders-api, path: services/orders, language: python, framework: fastapi, docker: {{ compose_service: orders }} }}\ndatastores:\n  - {{ name: db, kind: postgres, url: \"postgres://u:p@db/x\" }}\n"
             ),
             None,
             &[],
@@ -1479,36 +1629,41 @@ mod tests {
 
     #[test]
     fn connection_url_injects_password() {
-        let c = ctx_tmp();
-        let ds = |url: &str, pw: &str| Datastore {
+        let ds = |url: &str, pw: Option<&str>| Datastore {
             name: "c".into(),
             kind: DatastoreKind::Redis,
-            url: Secret::Literal(url.into()),
-            password: Some(Secret::Literal(pw.into())),
+            url: url.into(),
+            password: pw.map(Into::into),
         };
+        let url = |d: Datastore| d.connection_url().unwrap().expose_secret().to_string();
         assert_eq!(
-            ds("redis://localhost:6379/0", "p@ss")
-                .connection_url(&c)
-                .unwrap(),
+            url(ds("redis://localhost:6379/0", Some("p@ss"))),
             "redis://:p%40ss@localhost:6379/0"
         );
         assert_eq!(
-            ds("postgres://app@db:5432/x", "a b/c?d:e%")
-                .connection_url(&c)
-                .unwrap(),
-            "postgres://app:a%20b%2Fc%3Fd%3Ae%25@db:5432/x"
+            url(ds("postgres://app@db:5432/x", Some("a b/c?d:e%#"))),
+            "postgres://app:a%20b%2Fc%3Fd%3Ae%25%23@db:5432/x"
         );
         assert_eq!(
-            ds("postgres://app:old@db/x", "new")
-                .connection_url(&c)
-                .unwrap(),
+            url(ds("postgres://app:old@db/x", Some("new"))),
             "postgres://app:new@db/x"
         );
-        let none = Datastore {
-            password: None,
-            ..ds("redis://cache:6379/0", "")
-        };
-        assert_eq!(none.connection_url(&c).unwrap(), "redis://cache:6379/0");
+        assert_eq!(
+            url(ds("postgres://u@[::1]:5432/db", Some("pw"))),
+            "postgres://u:pw@[::1]:5432/db"
+        );
+        assert_eq!(
+            url(ds("redis://cache:6379/0", None)),
+            "redis://cache:6379/0"
+        );
+        let err = ds("not a url", Some("hunter2"))
+            .connection_url()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("datastore c") && !err.contains("hunter2"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1570,19 +1725,12 @@ mod tests {
             &format!(
                 "{MINIMAL}semantic: {{ embeddings: {{ model: {{ env: EMB, default: m1 }} }} }}\n"
             ),
-            Some("EMB=\nDB_URL=\n"),
+            Some("EMB=\n"),
             &[("PROC_EMPTY", "")],
         );
         assert_eq!(
             c.setting(&c.config.semantic.embeddings.model).unwrap(),
             "m1"
-        );
-        assert!(
-            Secret::Env {
-                env: "DB_URL".into()
-            }
-            .resolve(&c)
-            .is_err()
         );
         assert_eq!(c.env("PROC_EMPTY"), None);
     }
@@ -1630,7 +1778,10 @@ services:
   - {{ name: web, path: web, language: python, framework: angular }}
 "
         );
-        let problems = validate(&ctx_with(&yaml, None, &[]).config);
+        let mut config = ctx_with(&yaml, None, &[]).config;
+        let problems = validate(&config);
         assert_eq!(problems.len(), 5, "{problems:#?}");
+        config.version = 2;
+        assert!(validate(&config).iter().any(|p| p.contains("version")));
     }
 }

@@ -141,9 +141,11 @@ claude mcp add ops -- ops-mcp --root /path/to/workspace --mode operational-suppo
 
 ## Configuration — `ops.yaml`
 
-`ops init` discovers most of this. Every credential field takes either a literal value or
-`{ env: NAME }`. Env vars are read from the process environment first, then from `.env` at the
-workspace root.
+`ops init` discovers most of this. Credentials are quoted strings in `ops.yaml`, so `ops init`
+git-ignores the file and writes `ops.example.yaml` (credentials blank) for sharing. Quote them:
+YAML reads an unquoted `0123` as the number 123, and ops rejects that. Non-secret settings can be
+a literal or `{ env: NAME, default: … }`, read from the process environment first, then from
+`.env` at the workspace root.
 
 ```yaml
 version: 1
@@ -151,8 +153,8 @@ workspace: { name: shop, kind: monorepo }          # single | monorepo | multi-r
 memgraph:
   host: localhost
   port: 7687
-  username: { env: MEMGRAPH_USER }
-  password: { env: MEMGRAPH_PASSWORD }
+  username: "ops"                                   # credentials: quoted strings
+  password: "change-me"
 docker:
   compose_files: [docker-compose.yml]
 kubernetes:                                         # optional
@@ -181,8 +183,8 @@ services:
     datastores: [orders-db, cache]
     lsp: [pyright-langserver, --stdio]
 datastores:
-  - { name: orders-db, kind: postgres, url: { env: ORDERS_DB_URL } }
-  - { name: cache, kind: redis, url: "redis://localhost:6379/0", password: { env: REDIS_PASSWORD } }
+  - { name: orders-db, kind: postgres, url: "postgres://app:secret@localhost:5432/orders" }
+  - { name: cache, kind: redis, url: "redis://localhost:6379/0", password: "redis-secret" }
 logging:                                            # optional; these are the defaults
   level: info                                       # OPS_LOG overrides it (e.g. OPS_LOG=engine=debug)
   format: text                                      # stderr: text | json
@@ -197,7 +199,8 @@ changes:
 ```
 
 Override any value without editing the file using `OPS_`-prefixed env vars, with `__` between
-nesting levels, for example `OPS_MEMGRAPH__PORT=7688`.
+nesting levels, for example `OPS_MEMGRAPH__PORT=7688` or `OPS_MEMGRAPH__PASSWORD=…` (credentials
+inside lists, like `datastores`, can't be overridden this way).
 
 ## Embeddings and semantic search *(planned)*
 
