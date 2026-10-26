@@ -371,7 +371,6 @@ environment (verified in `src/mage/python/embeddings.py` at v3.14.0).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `EMBEDDINGS_MODEL` | `all-MiniLM-L6-v2` | The model the warmup service loads and checks (below). Keep it equal to `semantic.embeddings.model` in `ops.yaml`. `ops check` can't read the container's environment, so it prints the model `ops.yaml` resolves to for you to compare; a mismatch only means the first index downloads that model. |
 | `HF_HOME` | `/var/lib/memgraph/hf-cache` (set in compose) | Model cache, on the bind mount (`docker/memgraph/lib/hf-cache`), so models download once |
 | `HF_TOKEN` | unset | Hugging Face token for gated or private local models |
 | `HF_HUB_OFFLINE` | `0` | `1` = never download; models must already be in the cache (air-gapped) |
@@ -388,18 +387,21 @@ Any other LiteLLM provider variable works the same way, because the whole `.env`
 through. Only what you set is present; an unset key matters only if a model for that provider is
 chosen.
 
+The container doesn't choose the model. The MAGE `embeddings` module takes `model_name` from the
+configuration map of each call (falling back to its own `all-MiniLM-L6-v2`) and reads no model
+variable from its environment, so the model is set only in `ops.yaml` (b), per workspace
+(verified in `/usr/lib/memgraph/query_modules/embeddings.py` of `memgraph-mage:3.14.0`).
+
 **Ways to start it:**
 ```sh
-docker compose up -d                                          # defaults: local all-MiniLM-L6-v2, CPU, downloads on first use
-docker compose --profile embeddings up -d                     # also runs `embeddings-warmup`: downloads/loads EMBEDDINGS_MODEL
-                                                              # and checks the provider key now, not at first index
+docker compose up -d                                          # local models on CPU; a model downloads on first use
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d   # local models on NVIDIA GPUs
 ```
-- **`embeddings-warmup`** (profile `embeddings`): a one-shot service that waits for Memgraph, then
-  runs `CALL embeddings.model_info({model_name: $EMBEDDINGS_MODEL}) YIELD info RETURN info;` and
-  exits non-zero (with the redacted error) if the model can't load or the key is rejected.
-  *Builder: confirm `mgconsole` is in the `memgraph-mage` image; if not, use the `memgraph/mgconsole`
-  image for this service.*
+- **Warming up is `ops check`.** It calls `embeddings.model_info` with the workspace's
+  `semantic.embeddings` config, which loads the configured model (downloading it into `HF_HOME`
+  the first time) and fails, redacted, on a bad model name or rejected key. So the model is
+  ready before the first `ops index`, and it's always the model the index will use. There is no
+  separate warmup service.
 - **`docker-compose.gpu.yml`** switches the memgraph service to the CUDA image
   `memgraph/memgraph-mage:3.14.0-relwithdebinfo-cuda` (amd64 only) and adds
   `deploy.resources.reservations.devices: [{driver: nvidia, count: all, capabilities: [gpu]}]`.
@@ -511,7 +513,7 @@ Applied in the base spec and both plans. Two refinements came out of plan review
   - `save_incident_report` / `find_incident_reports`.
   - Staleness info on graph tools, and `reindex`.
 - Part 1 extractors: capture docstrings / JSDoc. New task: code cards, embedding on index, vector and text indexes. Part 2: `search_code`, vector-backed `recall`, `ops check` embedding status.
-- `docker-compose.yml`: pin the MAGE image (≥ 3.6), set `HF_HOME` on the bind mount, `env_file: .env`, and the `embeddings-warmup` service (profile `embeddings`). New `docker-compose.gpu.yml`. `.env.example` gains the variables in table (a).
+- `docker-compose.yml`: pin the MAGE image (≥ 3.6), set `HF_HOME` on the bind mount, `env_file: .env`. New `docker-compose.gpu.yml`. (A warmup service was dropped: `ops check` loads the configured model.) `.env.example` gains the variables in table (a).
 - New dependencies: a hash crate (`sha2`, already in the tree through sqlx), a file watcher
   (`notify`), and `uuid`, each passing `cargo deny`.
 

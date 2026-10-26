@@ -55,8 +55,7 @@ Cargo.toml              workspace: shared versions, lints
 deny.toml               dependency audit policy (cargo-deny)
 docker-compose.yml      Memgraph + Memgraph Lab; data bind-mounted at docker/memgraph/
 docker-compose.gpu.yml  optional GPU override for local embedding models
-Makefile                env / up / warmup / down shortcuts over docker compose
-scripts/                embeddings-warmup.sh, run by the embeddings-warmup service
+Makefile                env / up / down shortcuts over docker compose
 .env.example            credentials template (copy to .env)
 services/
   engine/               library: config, discovery, parsing, graph, store, logs, datastores, LSP
@@ -100,7 +99,7 @@ cargo deny check                  # must pass before any dependency change is me
 > (`ALTER USER … SET PASSWORD …`) or delete `docker/memgraph/` to start over.
 
 The `Makefile` wraps the same commands: `make env` (creates `.env`, never overwrites), `make up`,
-`make up-embeddings`, `make up-gpu`, `make warmup`, `make down`, `make logs`.
+`make up-gpu`, `make down`, `make logs`.
 
 **Memgraph Lab** (<http://localhost:3000>): choose *Connect manually* and enter host `memgraph`
 (not `localhost` or `127.0.0.1`: Lab connects from inside its container, where those mean Lab
@@ -112,11 +111,10 @@ cache, `log/` for logs; git-ignored). It survives `docker compose down` and rest
 snapshots every 5 minutes and on exit, and recovers on startup. Delete `docker/memgraph/` to start
 from an empty graph.
 
-`make warmup` (or `docker compose --profile embeddings run --rm embeddings-warmup`) loads
-`EMBEDDINGS_MODEL` up front and exits non-zero on a bad model name or provider key. The script is
-[`scripts/embeddings-warmup.sh`](scripts/embeddings-warmup.sh). With `--profile embeddings up -d` it
-runs in the background instead, and its result is only in `docker compose logs embeddings-warmup`. For local
-models on NVIDIA GPUs, add `-f docker-compose.yml -f docker-compose.gpu.yml`.
+The embedding model is chosen per workspace in `ops.yaml` (`semantic.embeddings.model`), not
+by the container. `ops check` loads it up front (downloading it the first time) and reports a bad
+model name or provider key. For local models on NVIDIA GPUs, add
+`-f docker-compose.yml -f docker-compose.gpu.yml`.
 
 > [!NOTE]
 > **Linux hosts:** the container runs as the `memgraph` user, so the bind-mounted directories must
@@ -163,7 +161,9 @@ kubernetes:                                         # optional
   namespaces: [shop]                                # allow-list; tools refuse other namespaces
 exclude: [node_modules, .venv, dist, .angular, __pycache__, .git]
 shared_libs:
-  - { name: common, path: libs/common, language: python }
+  - name: common
+    path: libs/common
+    language: python
 contracts:                                          # shared API schemas at service boundaries
   - name: orders-api
     kind: openapi                                   # openapi | library
@@ -183,8 +183,13 @@ services:
     datastores: [orders-db, cache]
     lsp: [pyright-langserver, --stdio]
 datastores:
-  - { name: orders-db, kind: postgres, url: "postgres://app:secret@localhost:5432/orders" }
-  - { name: cache, kind: redis, url: "redis://localhost:6379/0", password: "redis-secret" }
+  - name: orders-db
+    kind: postgres
+    url: "postgres://app:secret@localhost:5432/orders"
+  - name: cache
+    kind: redis
+    url: "redis://localhost:6379/0"
+    password: "redis-secret"
 logging:                                            # optional; these are the defaults
   level: info                                       # OPS_LOG overrides it (e.g. OPS_LOG=engine=debug)
   format: text                                      # stderr: text | json
@@ -222,7 +227,6 @@ That's why keys are set in `.env` before `docker compose up`.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `EMBEDDINGS_MODEL` | `all-MiniLM-L6-v2` | Model the warmup service loads; keep it equal to `semantic.embeddings.model` |
 | `HF_TOKEN` | unset | Gated or private Hugging Face models |
 | `HF_HUB_OFFLINE` | `0` | `1` = never download (air-gapped; pre-seed `docker/memgraph/lib/hf-cache`) |
 | `OPENAI_API_KEY` | unset | `openai/…` |
@@ -238,7 +242,6 @@ works too, because the whole `.env` is passed to the Memgraph container.
 
 ```sh
 docker compose up -d                                   # defaults: local model on CPU, downloaded on first use
-docker compose --profile embeddings up -d              # also download/load EMBEDDINGS_MODEL and check its key now
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d   # NVIDIA GPU for local models (Linux)
 ```
 

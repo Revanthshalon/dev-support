@@ -57,17 +57,14 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - `env_file: [{path: .env, required: false}]`, and `HF_HOME=/var/lib/memgraph/hf-cache`.
     - `command`: `--data-recovery-on-startup=true --storage-snapshot-interval-sec=300 --storage-snapshot-on-exit=true` (flag names verified in Memgraph v3.14.0 `src/flags/general.hpp`), plus the existing log flags.
     - Image pinned to `memgraph/memgraph-mage:3.14.0`.
-  - **`embeddings-warmup` service** (`profiles: [embeddings]`):
-    - Waits for Bolt, then runs `CALL embeddings.model_info({model_name: $EMBEDDINGS_MODEL}) YIELD info RETURN info;` through `mgconsole`, using the image's own if it has one, else `memgraph/mgconsole`.
-    - Exits non-zero on failure.
   - **`docker-compose.gpu.yml`:** sets the memgraph image to `memgraph/memgraph-mage:3.14.0-relwithdebinfo-cuda`, since the default image's PyTorch is CPU-only, and adds `deploy.resources.reservations.devices: [{driver: nvidia, count: all, capabilities: [gpu]}]`.
-  - **`.env.example`:** add every variable in layer-design table (a), commented, with its default.
+  - **`.env.example`:** add every variable in layer-design table (a), commented, with its default. (No model variable: the model is chosen per call from `ops.yaml`; `ops check` in Task 7c loads it ahead of the first index.)
   - **`.gitignore`:** update the `/docker/` comment to "Memgraph bind mount: data, logs, model cache".
   - **README:** add the Linux `chown` note. Find the uid with `docker run --rm <image> id memgraph`.
 - [ ] **Step 4: Verify.**
-  - Without Docker running: `docker compose config -q`, `docker compose --profile embeddings config -q`, and `docker compose -f docker-compose.yml -f docker-compose.gpu.yml config -q`. All exit 0.
+  - Without Docker running: `docker compose config -q` and `docker compose -f docker-compose.yml -f docker-compose.gpu.yml config -q`. Both exit 0.
   - With Docker:
-    1. `docker compose --profile embeddings up -d`. `docker compose logs embeddings-warmup` shows the model info, and the service exits 0.
+    1. `docker compose up -d`, then `CALL embeddings.model_info({model_name: "all-MiniLM-L6-v2"}) YIELD info RETURN info;` through the image's `mgconsole` shows the model info.
     2. `docker compose down && docker compose up -d`. Data created before the restart (`CREATE (:Probe {x:1})`) is still there.
     3. `docker/memgraph/lib/hf-cache` contains the model.
 - [ ] **Step 5: CI job for the Memgraph-backed tests.** Add an `integration` job to `.github/workflows/ci.yml`:
@@ -76,7 +73,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - A second step, gated by `if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'embeddings')`, runs `cargo test --workspace -- --ignored embed_`. It caches `~/.cache/huggingface` and sets `HF_HOME` in the service.
 
   **Naming rule for ignored tests:** a test that needs an embedding model starts with `embed_`, one that needs Postgres with `pg_`, one that needs pyright with `pyright_`. `pg_` and `pyright_` tests stay manual.
-- [ ] **Step 6: Commit.** `git commit -am "chore: memgraph bind mount, recovery, embeddings warmup, gpu override, integration CI"`
+- [ ] **Step 6: Commit.** `git commit -am "chore: memgraph bind mount, recovery, gpu override, integration CI"`
 
 ---
 
@@ -245,7 +242,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 - Consumes: `config::*`, `docker::load_compose`/`parse_compose`, `docker::parse_dockerfile`
 - Produces:
   - `discover::discover(root: &Path) -> Result<Config>`
-  - `discover::write_files(root: &Path, cfg: &Config, force: bool) -> Result<Vec<PathBuf>>`: writes `ops.yaml` (with a header comment block explaining each field, and saying credentials must be quoted strings), `ops.example.yaml` (the same with every credential blank, for committing), `.env.example` and `.mcp.json`, and adds `ops.yaml` to `.gitignore` (creating it if needed). Returns the paths it wrote. It serializes the `Config` that `discover` built, never a loaded `Ctx.config` (that one has env overrides merged in).
+  - `discover::write_files(root: &Path, cfg: &Config, force: bool) -> Result<Vec<PathBuf>>`: writes `ops.yaml` (with a header comment block explaining each field, and saying credentials must be quoted strings; list entries such as `shared_libs`, `datastores` and `services` in block style, one field per line, as in the spec's example), `ops.example.yaml` (the same with every credential blank, for committing), `.env.example` and `.mcp.json`, and adds `ops.yaml` to `.gitignore` (creating it if needed). Returns the paths it wrote. It serializes the `Config` that `discover` built, never a loaded `Ctx.config` (that one has env overrides merged in).
   - `discover::env_names(cfg: &Config) -> Vec<String>` (sorted, deduped): the `EnvOr` env names of settings (e.g. `EMBEDDINGS_MODEL`). Credentials have no env form.
   - `ops init` writes `semantic.embeddings.model: {env: EMBEDDINGS_MODEL, default: all-MiniLM-L6-v2}`, `incidents.dir: docs/incidents`, `correlation.clock_skew_ms: 500` with the three default `patterns` as a comment, and `changes.since: 7d` into the generated `ops.yaml`. It never git-ignores `ops-knowledge/`.
   - `discover::write_agent_instructions(root: &Path) -> Result<Vec<PathBuf>>`: for `ops init --agent-instructions` only (layer design §4.6). Appends a block between `<!-- ops-support -->` and `<!-- /ops-support -->` markers to each of `AGENTS.md` and `CLAUDE.md` that exists, or creates `AGENTS.md` when neither does. The block tells the agent to `recall` before changing or diagnosing a service, and to `remember` what it verified. A file that already has the marker is left as is.
@@ -711,7 +708,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - **Re-embed only what changed:** `:Chunk` nodes with no `embedding`, or whose `text_hash` differs from their `embedded_hash`, plus every chunk when `reembed_all` is set. `SET c.embedding = $vec, c.embedded_hash = c.text_hash`. Re-embedding has exactly two triggers: a changed `embed_fingerprint`, or a changed chunk `text_hash`. A Full run never re-embeds by itself, which matters for paid remote models.
     - **`--full`** always sets `rebuild_index` (but not `reembed_all`), because deleted nodes don't free vector-index memory until the index is dropped.
     - **`TextOnly`:** skip embedding, and record the reason in `IndexReport.embedding: String`.
-  - `ops check` prints `embeddings: vector (local all-MiniLM-L6-v2, dim 384)`, or `remote openai, dim 1536`, or `text-only: <reason>`. It also warns when `SHOW VECTOR INDEX INFO` reports more than 2× as many vectors as live nodes.
+  - `ops check` is also the warmup: its `embeddings.model_info` call with the workspace config loads the configured model (downloading it the first time) and reports a bad model name or rejected key, redacted, before the first `ops index`. It prints `embeddings: vector (local all-MiniLM-L6-v2, dim 384)`, or `remote openai, dim 1536`, or `text-only: <reason>`. It also warns when `SHOW VECTOR INDEX INFO` reports more than 2× as many vectors as live nodes.
 
 - [ ] **Step 1: Failing tests**
 ```rust
@@ -728,7 +725,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine embed`. Expected: FAIL.
 - [ ] **Step 3: Implement.** Before coding, confirm the procedure signatures with `CALL mg.procedures() YIELD name, signature WHERE name STARTS WITH 'embeddings' OR name STARTS WITH 'vector_search' OR name STARTS WITH 'text_search' RETURN *`.
-- [ ] **Step 4: Run.** Unit tests PASS. With `docker compose --profile embeddings up -d`, the `--ignored` tests PASS.
+- [ ] **Step 4: Run.** Unit tests PASS. With `docker compose up -d`, the `--ignored` tests PASS.
 - [ ] **Step 5: Commit.** `git commit -am "feat: code-card embeddings and search indexes"`
 
 ---

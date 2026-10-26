@@ -67,7 +67,7 @@ the code flow, inspect configuration and datastores, determine the root cause an
 ## Repository layout
 ```
 Cargo.toml                 workspace: services/{engine,cli,mcp}
-docker-compose.yml         memgraph (bind mount docker/memgraph/) + lab; `embeddings` profile for warmup
+docker-compose.yml         memgraph (bind mount docker/memgraph/) + lab
 docker-compose.gpu.yml     optional NVIDIA GPU override for local embedding models
 services/engine            library: config, discovery, parsing, graph, store, logs, datastores, lsp
 services/cli               binary `ops`: init | check | index [--full] | watch | knowledge export/import
@@ -92,7 +92,9 @@ kubernetes:                                         # optional
   namespaces: [shop]                                # allow-list; tools refuse others
 exclude: [node_modules, .venv, dist, .angular, __pycache__, .git]
 shared_libs:
-  - { name: common, path: libs/common, language: python }
+  - name: common
+    path: libs/common
+    language: python
 contracts:                                          # shared API schemas at service boundaries
   - name: orders-api
     kind: openapi                                   # openapi | library
@@ -112,8 +114,13 @@ services:
     datastores: [orders-db, cache]
     lsp: [pyright-langserver, --stdio]
 datastores:
-  - { name: orders-db, kind: postgres, url: "postgres://app:secret@localhost:5432/orders" }
-  - { name: cache, kind: redis, url: "redis://localhost:6379/0", password: "redis-secret" }
+  - name: orders-db
+    kind: postgres
+    url: "postgres://app:secret@localhost:5432/orders"
+  - name: cache
+    kind: redis
+    url: "redis://localhost:6379/0"
+    password: "redis-secret"
 logging:                                            # optional; these are the defaults
   level: info                                       # trace | debug | info | warn | error
   format: text                                      # stderr format: text | json
@@ -123,7 +130,7 @@ logging:                                            # optional; these are the de
 semantic:                                           # optional; full option list in the layer design §4.5
   embeddings:
     enabled: true
-    model: { env: EMBEDDINGS_MODEL, default: all-MiniLM-L6-v2 }   # "provider/model" = remote via LiteLLM
+    model: { env: EMBEDDINGS_MODEL, default: all-MiniLM-L6-v2 }   # decides the model; env read from the workspace, not the container
     chunking: { enabled: true, max_tokens: auto, overlap_tokens: 32 }  # long symbols embedded in overlapping chunks
 incidents:
   dir: docs/incidents                               # where write_rca reports are saved
@@ -133,7 +140,9 @@ changes:
   since: 7d                                         # default look-back for recent_changes
 indexing:                                           # optional; layer design §3.1
   max_file_bytes: 1MiB                              # 0 = no limit; also --max-file-bytes / OPS_INDEXING__MAX_FILE_BYTES
-  overrides: [{ path: "services/legacy/**", max_file_bytes: 8MiB }]
+  overrides:
+    - path: "services/legacy/**"
+      max_file_bytes: 8MiB
 ```
 `ops init` also writes `ops.example.yaml` (the same file with every credential blank, for sharing
 and committing), `.env.example` (every `env:` name a setting references) and `.mcp.json`, and adds

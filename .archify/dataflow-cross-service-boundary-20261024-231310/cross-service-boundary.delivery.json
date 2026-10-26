@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "faa4d9d6-2f19-4c98-8fc9-2c5ce5126bd2",
+  "status": "current",
+  "command": "deliver",
+  "type": "dataflow",
+  "input": "/Users/revanth/Projects/ops-support/.archify/dataflow-cross-service-boundary-20261024-231310/candidate.json",
+  "output": "/Users/revanth/Projects/ops-support/.archify/dataflow-cross-service-boundary-20261024-231310/cross-service-boundary.html",
+  "specification": {
+    "sha256": "e1bd7aa67ad9917aa0fe640c79f21051869d79e3dfcf0096b10520810883bfd8",
+    "bytes": 4541
+  },
+  "artifact": {
+    "sha256": "342e71f00129741a01a2e52a8a99d568a7a60f731cb2dbecbe73b12a7a76d90e",
+    "bytes": 825514
+  }
+}

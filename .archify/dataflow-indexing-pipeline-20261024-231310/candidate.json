@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "ops index: from a Python file to the Memgraph graph",
+    "subtitle": "Planned pipeline (Part 1 Tasks 4, 6, 7): parse each file, build file-local nodes, recompute cross-file links, upsert in one transaction",
+    "output": ".archify/dataflow-indexing-pipeline-20261024-231310/indexing-pipeline.html",
+    "quality_profile": "showcase"
+  },
+  "stages": [
+    { "label": "Source" },
+    { "label": "Parse" },
+    { "label": "Extract" },
+    { "label": "Build graph" },
+    { "label": "Store" }
+  ],
+  "nodes": [
+    { "id": "pyfile", "type": "frontend", "label": "app/main.py", "sublabel": "changed file (hash differs)", "stage": 0, "row": 0, "tag": "Python" },
+    { "id": "infra", "type": "frontend", "label": "compose + ops.yaml", "sublabel": "Dockerfiles, OpenAPI", "stage": 0, "row": 2, "tag": "every run" },
+    { "id": "treesitter", "type": "backend", "label": "tree-sitter", "sublabel": "concrete syntax tree", "stage": 1, "row": 0, "tag": "python 0.25" },
+    { "id": "infraparse", "type": "backend", "label": "docker / config", "sublabel": "serde_norway + spans", "stage": 1, "row": 2, "tag": "Task 2" },
+    { "id": "extract", "type": "backend", "label": "python::extract", "sublabel": "FileFacts: Symbols", "stage": 2, "row": 0, "tag": "Task 4" },
+    { "id": "wsgraph", "type": "backend", "label": "workspace_graph", "sublabel": "Service, Datastore, EnvVar", "stage": 2, "row": 2, "tag": "Task 6" },
+    { "id": "filegraph", "type": "backend", "label": "file_graph", "sublabel": "nodes + file-local edges", "stage": 3, "row": 0, "tag": "pure" },
+    { "id": "link", "type": "backend", "label": "graph::link", "sublabel": "cross-file edges, Queue, Table", "stage": 3, "row": 2, "tag": "pure" },
+    { "id": "memgraph", "type": "database", "label": "Memgraph", "sublabel": "layer: structural", "stage": 4, "row": 1, "tag": "one txn" },
+    { "id": "reconcile", "type": "security", "label": "semantic reconcile", "sublabel": "stale / orphaned", "stage": 4, "row": 3, "tag": "Task 7d" }
+  ],
+  "flows": [
+    { "id": "src-text", "from": "pyfile", "to": "treesitter", "label": "source text", "variant": "emphasis" },
+    { "id": "cst", "from": "treesitter", "to": "extract", "label": "syntax tree", "variant": "emphasis" },
+    { "id": "facts", "from": "extract", "to": "filegraph", "label": "Symbol facts", "variant": "emphasis", "classification": "calls, raises, routes" },
+    { "id": "upsert", "from": "filegraph", "to": "memgraph", "label": "MERGE by id", "variant": "emphasis", "classification": "SET n += props" },
+    { "id": "infra-text", "from": "infra", "to": "infraparse", "label": "YAML / Dockerfile" },
+    { "id": "infra-model", "from": "infraparse", "to": "wsgraph", "label": "services, env" },
+    { "id": "ws-nodes", "from": "wsgraph", "to": "memgraph", "label": "service nodes" },
+    { "id": "ws-edges", "from": "wsgraph", "to": "link", "label": "compose edges" },
+    { "id": "props", "from": "memgraph", "to": "link", "label": "node props", "classification": "no re-parsing" },
+    { "id": "link-edges", "from": "link", "to": "memgraph", "label": "CALLS, BOUNDARY", "variant": "emphasis" },
+    { "id": "vanished", "from": "memgraph", "to": "reconcile", "label": "changed anchors", "variant": "security", "classification": "Knowledge is never deleted" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "1 · Parse (tree-sitter)",
+      "items": [
+        "`def pay(...)` is a function_definition node; its decorator @router.post(...) sits on the parent decorated_definition",
+        "Every `call` node gives Call {name, line}; `raise_statement` gives Raise; each `except_clause` gives Handler {types, try range, action}",
+        "The extractor walks the tree once and returns FileFacts: imports, Symbols, env reads"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "2 · Build (pure, no database)",
+      "items": [
+        "file_graph turns one file's Symbols into File / Function / Class / Route / LogStatement / Chunk nodes",
+        "Ids carry no line numbers, e.g. sym:orders:app/main.py:pay, so an edit keeps the same node",
+        "Facts that need other files (calls, HTTP calls, imports, queue and SQL ops) are stored on the node as properties"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "3 · Store (incremental)",
+      "items": [
+        "Only added or changed files are parsed; nodes are upserted, never deleted and recreated",
+        "Then every link edge is recomputed from node properties by graph::link",
+        "Steps run in one transaction; then reconcile marks Knowledge stale or orphaned"
+      ]
+    }
+  ]
+}

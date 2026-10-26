@@ -1,0 +1,142 @@
+{
+  "schema_version": 3,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Semantic layer: how a Knowledge entry tracks code drift",
+    "subtitle": "Planned (layer design \u00a74.3): status changes when the anchored code changes; indexing never deletes an entry",
+    "output": ".archify/lifecycle-knowledge-drift-20261024-231310/knowledge-drift.html",
+    "quality_profile": "showcase"
+  },
+  "mainPath": [
+    "remembered",
+    "current",
+    "stale",
+    "superseded"
+  ],
+  "states": [
+    {
+      "id": "remembered",
+      "type": "start",
+      "label": "remember()",
+      "sublabel": "anchors resolved to ids",
+      "tag": "MCP tool",
+      "step": "01"
+    },
+    {
+      "id": "current",
+      "type": "success",
+      "label": "Current",
+      "sublabel": "anchor hash matches",
+      "tag": "status",
+      "step": "02"
+    },
+    {
+      "id": "stale",
+      "type": "waiting",
+      "label": "Stale",
+      "sublabel": "anchored code changed",
+      "tag": "needs review",
+      "step": "03"
+    },
+    {
+      "id": "superseded",
+      "type": "neutral",
+      "label": "Superseded",
+      "sublabel": "revise() wrote a new entry",
+      "tag": "retracted",
+      "step": "04"
+    },
+    {
+      "id": "orphaned",
+      "type": "failure",
+      "label": "Orphaned",
+      "sublabel": "anchor node vanished",
+      "tag": "anchor_key kept"
+    },
+    {
+      "id": "retracted",
+      "type": "neutral",
+      "label": "Retracted",
+      "sublabel": "retract(id, reason)",
+      "tag": "never deleted"
+    }
+  ],
+  "transitions": [
+    {
+      "id": "write",
+      "from": "remembered",
+      "to": "current",
+      "label": "ABOUT edges"
+    },
+    {
+      "id": "drift",
+      "from": "current",
+      "to": "stale",
+      "label": "code changed",
+      "variant": "dashed"
+    },
+    {
+      "id": "revise",
+      "from": "stale",
+      "to": "superseded",
+      "label": "revise()",
+      "variant": "emphasis"
+    },
+    {
+      "id": "vanish",
+      "from": "current",
+      "to": "orphaned",
+      "label": "code deleted",
+      "variant": "security"
+    },
+    {
+      "id": "moved",
+      "from": "orphaned",
+      "to": "stale",
+      "label": "same qualname"
+    },
+    {
+      "id": "returned",
+      "from": "orphaned",
+      "to": "current",
+      "label": "code restored"
+    },
+    {
+      "id": "retract-stale",
+      "from": "stale",
+      "to": "retracted",
+      "label": "retract()"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Anchored by stable ids",
+      "items": [
+        "An entry points at structural nodes through ABOUT / STEP / FROM / TO edges",
+        "Ids have no line numbers, so ordinary edits keep the edges attached",
+        "Each anchor edge stores anchor_key and anchor_hash; reconcile compares them after every ops index"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Drift, not deletion",
+      "items": [
+        "Function, Class, Schema anchors compare body_hash; a File compares its content hash",
+        "Code moved to another file: re-attached by qualname within the service, marked Stale",
+        "Code deleted: Orphaned, anchor_key kept; if the code returns with the same hash it is Current again",
+        "revise() writes a new entry that SUPERSEDES the stale one; the new entry starts Current"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Read paths",
+      "items": [
+        "code_context, trace_flow and service_map return attached entries, with stale ones flagged",
+        "recall and search_code search entries by meaning (vector + text)",
+        "ops knowledge export writes them to a committed ops-knowledge/ file",
+        "retract(id, reason) works from any status (drawn once, from Stale); entries are never hard-deleted"
+      ]
+    }
+  ]
+}

@@ -28,22 +28,6 @@ services:
       - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD:-ops}
       - HF_HOME=/var/lib/memgraph/hf-cache # model cache on the bind mount: downloads once
 
-  # One-shot: `docker compose --profile embeddings up -d` loads EMBEDDINGS_MODEL now (downloading
-  # it if needed) and checks the provider key, instead of failing at the first `ops index`.
-  embeddings-warmup:
-    image: memgraph/memgraph-mage:3.14.0 # ships mgconsole and a shell (the mgconsole image has no shell)
-    profiles: [embeddings]
-    depends_on:
-      - memgraph
-    restart: "no"
-    environment:
-      - MEMGRAPH_USER=${MEMGRAPH_USER:-ops}
-      - MEMGRAPH_PASSWORD=${MEMGRAPH_PASSWORD:-ops}
-      - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL:-all-MiniLM-L6-v2}
-    volumes:
-      - ./scripts/embeddings-warmup.sh:/warmup.sh:ro
-    entrypoint: ["/bin/sh", "/warmup.sh"]
-
   lab:
     image: memgraph/lab:3.14.0 # same release as memgraph-mage; pinned like it
     container_name: memgraph-lab

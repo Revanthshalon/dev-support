@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "Cross-service links: from evidence to BOUNDARY edges",
+    "subtitle": "Planned (base spec + flow design): graph::link derives every cross-service edge, then summarises each service pair as one BOUNDARY",
+    "output": ".archify/dataflow-cross-service-boundary-20261024-231310/cross-service-boundary.html",
+    "quality_profile": "showcase"
+  },
+  "stages": [
+    { "label": "Evidence in files" },
+    { "label": "Link edges" },
+    { "label": "Summarise" },
+    { "label": "Used by tools" }
+  ],
+  "nodes": [
+    { "id": "compose", "type": "frontend", "label": "docker-compose.yml", "sublabel": "depends_on, host in env", "stage": 0, "row": 0, "tag": "compose" },
+    { "id": "http", "type": "frontend", "label": "HTTP calls + routes", "sublabel": "httpx, HttpClient", "stage": 0, "row": 1, "tag": "http" },
+    { "id": "openapi", "type": "frontend", "label": "OpenAPI / schemas", "sublabel": "shared contracts", "stage": 0, "row": 2, "tag": "contract" },
+    { "id": "imports", "type": "frontend", "label": "imports", "sublabel": "from common.db import", "stage": 0, "row": 3, "tag": "shared_lib" },
+    { "id": "asyncdb", "type": "frontend", "label": "queue + SQL ops", "sublabel": "lpush, .delay, INSERT", "stage": 0, "row": 4, "tag": "queue, table" },
+    { "id": "e-compose", "type": "messagebus", "label": "DEPENDS_ON", "sublabel": "CONNECTS_TO, SHARES_VOLUME", "stage": 1, "row": 0 },
+    { "id": "e-http", "type": "messagebus", "label": "CALLS_API", "sublabel": "call path matched to route", "stage": 1, "row": 1 },
+    { "id": "e-contract", "type": "messagebus", "label": "PROVIDES / CONSUMES", "sublabel": "same contract", "stage": 1, "row": 2 },
+    { "id": "e-lib", "type": "messagebus", "label": "USES_LIB", "sublabel": "both use one library", "stage": 1, "row": 3 },
+    { "id": "e-async", "type": "messagebus", "label": "SENDS_TO / RECEIVES", "sublabel": "READS / WRITES_TABLE", "stage": 1, "row": 4 },
+    { "id": "rule", "type": "backend", "label": "BOUNDARY rule", "sublabel": "per service pair, last step", "stage": 2, "row": 2, "tag": "graph::link" },
+    { "id": "smap", "type": "database", "label": "service_map", "sublabel": "via + evidence, blast radius", "stage": 3, "row": 1, "tag": "MCP" },
+    { "id": "trace", "type": "database", "label": "trace_flow", "sublabel": "error_paths, timeline hops", "stage": 3, "row": 3, "tag": "MCP" }
+  ],
+  "flows": [
+    { "from": "compose", "to": "e-compose", "label": "compose wiring" },
+    { "from": "http", "to": "e-http", "label": "path + method" },
+    { "from": "openapi", "to": "e-contract", "label": "declared API" },
+    { "from": "imports", "to": "e-lib", "label": "import names" },
+    { "from": "asyncdb", "to": "e-async", "label": "queue / table" },
+    { "from": "e-compose", "to": "rule", "label": "via compose" },
+    { "from": "e-http", "to": "rule", "label": "via http" },
+    { "from": "e-contract", "to": "rule", "label": "via contract", "variant": "emphasis" },
+    { "from": "e-lib", "to": "rule", "label": "via shared_lib" },
+    { "from": "e-async", "to": "rule", "label": "via queue, table" },
+    { "from": "rule", "to": "smap", "label": "BOUNDARY edge", "variant": "emphasis" },
+    { "from": "rule", "to": "trace", "label": "service hops" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "One BOUNDARY per service pair",
+      "items": [
+        "(:Service)-[:BOUNDARY {via, evidence}]->(:Service), consumer to provider",
+        "via lists every kind of evidence found; evidence lists the underlying edges",
+        "Computed after all other link edges, from the graph alone"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Adding a new cross-service link (e.g. gRPC)",
+      "items": [
+        "1. Parser: record the fact on the Symbol (e.g. grpc_calls {service, method, line}), Task 4",
+        "2. Store it as a node property so link never re-parses, Task 6",
+        "3. graph::link: resolve it to an edge (e.g. CALLS_RPC) and add the rel to LINK_RELS",
+        "4. BOUNDARY rule: add the new via value; 5. fixture + test, then teach trace_flow to follow it"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Why links live in one place",
+      "items": [
+        "Incremental indexing deletes and recomputes every LINK_RELS edge each run",
+        "So a change in one service updates its boundaries with others automatically",
+        "Name-based resolution is a marked ponytail; LSP can sharpen it later"
+      ]
+    }
+  ]
+}
