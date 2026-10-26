@@ -19,7 +19,7 @@ So it's tested without a database. `store` is the only module that talks to Memg
 - The workspace stays `services/{engine,cli,mcp}`. The `cli` binary is named `ops`, and the `mcp` binary is named `ops-mcp`.
 - Shared crate versions go in root `[workspace.dependencies]`; member crates use `{ workspace = true }`.
 - No `neo4rs`. Grammars are exactly python, typescript, html, css, yaml, json and containerfile (all already in the workspace). No MySQL or SQLite drivers.
-- A secret field is `Secret = Literal(String) | { env: String }`. Secret values never appear in `Debug` output, logs or errors.
+- A credential field is a `secrecy::SecretString`, written in `ops.yaml` as a quoted string; there is no `{ env: NAME }` form for credentials. Secret values never appear in `Debug` output, logs or errors, and are read only through `expose_secret()`. `ops.yaml` is git-ignored because it holds them.
 - Node ids are deterministic, unique within a workspace, and **contain no line numbers** (see Task 6), so semantic anchors survive edits.
 - Every structural delete matches `layer: "structural"`. No indexing path deletes or rewrites a `:Knowledge` node. Only the reconcile step (Task 7d) changes its `status` and `ABOUT` edges.
 - Indexing runs under the single-writer lock `.ops/index.lock` (Task 7).
@@ -33,7 +33,7 @@ So it's tested without a database. `store` is the only module that talks to Memg
 1. **Re-running `ops init`** on a workspace whose `ops.yaml` the user edited must not overwrite it without `--force`. Test: `init_refuses_overwrite` (Task 3).
 2. **`node_modules`, `.venv`, minified bundles, huge generated files** must not be indexed and must not blow up memory. Test: `build_skips_excluded_and_large` (Task 6).
 3. **Duplicate node ids** from two same-named functions in one file (nested `def`, overloads, `@property` getter and setter) would silently merge nodes. Test: `ids_are_unique` (Task 6).
-4. **Missing env var for a secret**: `ops check` and `Secret::resolve` must name the variable and never print a value. Test: `secret_missing_env_names_var` (Task 1).
+4. **A credential that's empty or written as an unquoted number** (`password: 0123` is the integer 123 in YAML): loading must fail, or `validate` must name the field, and neither may print the value. Tests: `secret_must_be_a_quoted_string`, `empty_secret_named_by_field` (Task 1).
 5. **Editing one file and re-indexing** must give exactly the graph a `--full` run would, touch only that file, and leave semantic entries on unchanged code untouched. Tests: `incremental_equals_full` (Task 7), `knowledge_survives_reindex` (Task 7d), both ignored and needing Memgraph.
 
 ---
@@ -57,17 +57,14 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - `env_file: [{path: .env, required: false}]`, and `HF_HOME=/var/lib/memgraph/hf-cache`.
     - `command`: `--data-recovery-on-startup=true --storage-snapshot-interval-sec=300 --storage-snapshot-on-exit=true` (flag names verified in Memgraph v3.14.0 `src/flags/general.hpp`), plus the existing log flags.
     - Image pinned to `memgraph/memgraph-mage:3.14.0`.
-  - **`embeddings-warmup` service** (`profiles: [embeddings]`):
-    - Waits for Bolt, then runs `CALL embeddings.model_info({model_name: $EMBEDDINGS_MODEL}) YIELD info RETURN info;` through `mgconsole`, using the image's own if it has one, else `memgraph/mgconsole`.
-    - Exits non-zero on failure.
   - **`docker-compose.gpu.yml`:** sets the memgraph image to `memgraph/memgraph-mage:3.14.0-relwithdebinfo-cuda`, since the default image's PyTorch is CPU-only, and adds `deploy.resources.reservations.devices: [{driver: nvidia, count: all, capabilities: [gpu]}]`.
-  - **`.env.example`:** add every variable in layer-design table (a), commented, with its default.
+  - **`.env.example`:** add every variable in layer-design table (a), commented, with its default. (No model variable: the model is chosen per call from `ops.yaml`; `ops check` in Task 7c loads it ahead of the first index.)
   - **`.gitignore`:** update the `/docker/` comment to "Memgraph bind mount: data, logs, model cache".
   - **README:** add the Linux `chown` note. Find the uid with `docker run --rm <image> id memgraph`.
 - [ ] **Step 4: Verify.**
-  - Without Docker running: `docker compose config -q`, `docker compose --profile embeddings config -q`, and `docker compose -f docker-compose.yml -f docker-compose.gpu.yml config -q`. All exit 0.
+  - Without Docker running: `docker compose config -q` and `docker compose -f docker-compose.yml -f docker-compose.gpu.yml config -q`. Both exit 0.
   - With Docker:
-    1. `docker compose --profile embeddings up -d`. `docker compose logs embeddings-warmup` shows the model info, and the service exits 0.
+    1. `docker compose up -d`, then `CALL embeddings.model_info({model_name: "all-MiniLM-L6-v2"}) YIELD info RETURN info;` through the image's `mgconsole` shows the model info.
     2. `docker compose down && docker compose up -d`. Data created before the restart (`CREATE (:Probe {x:1})`) is still there.
     3. `docker/memgraph/lib/hf-cache` contains the model.
 - [ ] **Step 5: CI job for the Memgraph-backed tests.** Add an `integration` job to `.github/workflows/ci.yml`:
@@ -76,7 +73,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - A second step, gated by `if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'embeddings')`, runs `cargo test --workspace -- --ignored embed_`. It caches `~/.cache/huggingface` and sets `HF_HOME` in the service.
 
   **Naming rule for ignored tests:** a test that needs an embedding model starts with `embed_`, one that needs Postgres with `pg_`, one that needs pyright with `pyright_`. `pg_` and `pyright_` tests stay manual.
-- [ ] **Step 6: Commit.** `git commit -am "chore: memgraph bind mount, recovery, embeddings warmup, gpu override, integration CI"`
+- [ ] **Step 6: Commit.** `git commit -am "chore: memgraph bind mount, recovery, gpu override, integration CI"`
 
 ---
 
@@ -88,8 +85,8 @@ The workspace setup below is already in the repo; only check it. The compose cha
 **Interfaces:**
 - Produces:
   - `config::Config { version: u32, workspace: Workspace, memgraph: MemgraphCfg, docker: DockerCfg, kubernetes: Option<K8sCfg>, exclude: Vec<String>, shared_libs: Vec<Lib>, contracts: Vec<Contract>, services: Vec<Service>, datastores: Vec<Datastore> }`. Field names and nesting follow the spec's YAML exactly.
-  - `Workspace { name, kind }`
-  - `MemgraphCfg { host: String, port: u16, username: Option<Secret>, password: Option<Secret> }`
+  - `Workspace { name, kind: WorkspaceKind /* single | monorepo | multi-repo */ }`
+  - `MemgraphCfg { host: String, port: u16, username: Option<SecretString>, password: Option<SecretString> }`
   - `DockerCfg { compose_files: Vec<String> }`
   - `K8sCfg { kubeconfig: Option<String>, context: Option<String>, namespaces: Vec<String> }`
   - `Lib { name, path, language }`
@@ -98,7 +95,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `SemanticCfg { embeddings: EmbeddingsCfg }`. Every `EmbeddingsCfg` field is an `EnvOr<_>` with the layer design's §4.5(b) defaults: `enabled` (true), `model` ("all-MiniLM-L6-v2"), `device` (null), `batch_size` (2000), `chunk_size` (48), `api_base` (null), `input_type` ("document"), `query_input_type` ("query"), `dimensions` (null), `timeout` (60), `num_retries` (3), `normalize` (true), `remote_batch_size` (null), `concurrency` (4; validate 1–32), `metric` ("cos"), `scalar_kind` ("f32"). `device` is an untagged enum: null, a string, an int, or a list.
   - `IncidentsCfg { dir: String /* "docs/incidents" */ }`
   - `ByteSize(u64)`, parsed from `"1MiB"`, `"512KiB"`, `"8MiB"`, `"2GiB"`, `"1048576"` or `0`, where 0 means no limit. Bad units are an error naming the field.
-  - `IndexingCfg { max_file_bytes: EnvOr<ByteSize> /* 1MiB */, skip_minified: bool /* true */, overrides: Vec<Override { path: String /* glob */, max_file_bytes: Option<ByteSize>, skip: bool }> }`, plus `indexing::limit_for(cfg, relpath) -> Limit { max_bytes: Option<u64>, skip: bool }`: first matching glob wins. Add `globset` and run `cargo deny check`.
+  - `IndexingCfg { max_file_bytes: EnvOr<ByteSize> /* 1MiB */, skip_minified: bool /* true */, overrides: Vec<Override { path: String /* glob */, max_file_bytes: Option<ByteSize>, skip: bool }> }`, plus `indexing::Limits::new(ctx: &Ctx) -> Result<Limits>` (compiles the override globs once and resolves `max_file_bytes` once; a bad glob fails here) and `limits.for_path(relpath) -> Limit { max_bytes: Option<u64>, skip: bool }`: first matching glob wins. Add `globset` and run `cargo deny check`.
   - `ChunkingCfg { enabled: bool /* true */, max_tokens: MaxTokens /* Auto | N */, remote_max_tokens: usize /* 512 */, overlap_tokens: usize /* 32 */, max_chunks_per_symbol: usize /* 32 */, strategy: Strategy /* syntax | lines */, aggregate: Aggregate /* max | mean_top2 */ }` as `EmbeddingsCfg.chunking` (`#[serde(default)]`). Validate `overlap_tokens < max_tokens` when `max_tokens` is a number.
   - `Config` gains `indexing: IndexingCfg` (`#[serde(default)]`).
   - `CorrelationCfg { patterns: Vec<String> /* the 3 defaults in flow design §2.1 */, clock_skew_ms: u64 /* 500 */ }` and `ChangesCfg { since: String /* "7d" */ }`, as `Config.correlation` and `Config.changes` (`#[serde(default)]`). `validate` compiles each pattern and reports one without a named `id` group, and checks `since` against `^\d+[dhw]$` (max 90d).
@@ -107,8 +104,8 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - `Service { name, path, language, framework: Framework, uses: Vec<String>, api: Option<Api{prefix: String}>, docker: Option<ServiceDocker{compose_service: Option<String>, dockerfile: Option<String>}>, kubernetes: Option<ServiceK8s{namespace, selector, container: Option<String>}>, logs: Option<LogsCfg>, datastores: Vec<String>, lsp: Option<Vec<String>> }`
   - `enum Framework { Fastapi, Worker, Angular, None }` (serde lowercase)
   - `LogsCfg { source: LogSourceKind /* compose|kubernetes|file|command */, file: Option<String>, command: Option<Vec<String>> }`
-  - `Datastore { name, kind: DatastoreKind /* postgres|redis */, url: Secret, password: Option<Secret> }`
-  - `#[serde(untagged)] enum Secret { Literal(String), Env { env: String } }`, with `impl Secret { fn resolve(&self, ctx: &Ctx) -> anyhow::Result<String>; fn env_name(&self) -> Option<&str> }` and a manual `Debug` that prints `Secret(env=NAME)` or `Secret(***)`.
+  - `Datastore { name, kind: DatastoreKind /* postgres|redis */, url: SecretString, password: Option<SecretString> }`
+  - Credentials are `secrecy::SecretString` (feature `serde`), deserialized through `config::secret::deserialize` so only a quoted string is accepted: a YAML number or bool is an error naming the field, never the value. `config::secret::serialize` exposes the value only for writing `ops.yaml` (Task 3). `Ctx.config` has the `OPS_*` overrides merged in, so it is never written back to disk.
   - `Ctx { root: PathBuf, config: Config }` (+ private dotenv map), with:
     - `Ctx::load(start: &Path) -> Result<Ctx>`: walks up to `ops.yaml`, overlays `OPS_` env through the `config` crate, reads `.env`.
     - `ctx.env(name) -> Option<String>`: process env first, then `.env`.
@@ -116,7 +113,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - `ctx.datastore(name) -> Result<&Datastore>`
     - `ctx.lib(name) -> Option<&Lib>`
     - `ctx.abs(rel: &str) -> PathBuf`
-  - `Datastore::connection_url(&self, ctx) -> Result<String>`: puts `password` into the URL's userinfo when set.
+  - `Datastore::connection_url(&self) -> Result<SecretString>`: puts `password` into the URL's userinfo when set, through `url::Url::set_password` (the `url` crate is already in the tree).
   - `redact::redact(text: &str) -> String`
   - `config::validate(&Config) -> Vec<String>`: human-readable problems.
 
@@ -124,17 +121,17 @@ The workspace setup below is already in the repo; only check it. The compose cha
 ```rust
 #[test] fn parses_spec_example() { let c: Config = serde_norway::from_str(SPEC_YAML).unwrap();
   assert_eq!(c.services[0].framework, Framework::Fastapi);
-  assert!(matches!(c.datastores[1].url, Secret::Literal(_)));
+  assert_eq!(c.datastores[1].url.expose_secret(), "redis://localhost:6379/0");
   assert_eq!(c.kubernetes.unwrap().namespaces, vec!["shop"]); }
-#[test] fn secret_missing_env_names_var() { let err = Secret::Env{env:"NOPE_X".into()}.resolve(&ctx_tmp()).unwrap_err().to_string();
-  assert!(err.contains("NOPE_X")); }
-#[test] fn secret_debug_hides_literal() { assert!(!format!("{:?}", Secret::Literal("hunter2".into())).contains("hunter2")); }
+#[test] fn secret_must_be_a_quoted_string() { /* `password: 0123` (YAML integer) → load error naming `memgraph.password`, not containing "123" */ }
+#[test] fn empty_secret_named_by_field() { /* datastore url "" → validate problem mentioning "datastore db" and "url" */ }
+#[test] fn secret_debug_hides_literal() { /* format!("{:?}", ctx.config) never contains a credential's value */ }
 #[test] fn semantic_defaults_and_env() { /* ops.yaml without `semantic:` → model "all-MiniLM-L6-v2", concurrency 4, metric "cos";
   with `model: {env: EMBEDDINGS_MODEL, default: "all-MiniLM-L6-v2"}` and EMBEDDINGS_MODEL=openai/text-embedding-3-small in .env → resolves to the openai model;
   concurrency 40 → validate reports it; incidents.dir defaults to "docs/incidents" */ }
 #[test] fn byte_size_and_overrides() { assert_eq!("8MiB".parse::<ByteSize>().unwrap().0, 8 << 20); assert_eq!("0".parse::<ByteSize>().unwrap().0, 0); assert!("8MB?".parse::<ByteSize>().is_err());
   /* deserializes from YAML string "8MiB", YAML integer 8388608, and env string "8388608" alike */
-  /* overrides [legacy/**/*.py → 8MiB, **/generated/** → skip]: limit_for("services/legacy/a/x.py").max_bytes == Some(8<<20); limit_for("x/generated/y.ts").skip; default → Some(1<<20); max_file_bytes 0 → None */ }
+  /* overrides [legacy/**/*.py → 8MiB, **/generated/** → skip]: limits.for_path("services/legacy/a/x.py").max_bytes == Some(8<<20); limits.for_path("x/generated/y.ts").skip; default → Some(1<<20); max_file_bytes 0 → None */ }
 #[test] fn correlation_and_changes_defaults() { /* defaults: 3 patterns, skew 500, since "7d"; `correlation: {clock_skew_ms: 900}` alone keeps the 3 default patterns; a pattern without (?P<id>…) → validate problem; since "1y" → problem; the traceparent default extracts "4bf92f3577b34da6a3ce929d0e0e4736" from "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" */ }
 #[test] fn chunking_defaults() { /* no chunking section → enabled, MaxTokens::Auto, overlap 32, max_chunks 32, Strategy::Syntax, Aggregate::Max; overlap 300 with max_tokens 256 → validate problem */ }
 #[test] fn ops_env_override() { /* tmp ops.yaml port 7687; with OPS_MEMGRAPH__PORT=7688 set for the test → ctx.config.memgraph.port == 7688 (u16; may need config's try_parsing(true)) */ }
@@ -245,8 +242,8 @@ The workspace setup below is already in the repo; only check it. The compose cha
 - Consumes: `config::*`, `docker::load_compose`/`parse_compose`, `docker::parse_dockerfile`
 - Produces:
   - `discover::discover(root: &Path) -> Result<Config>`
-  - `discover::write_files(root: &Path, cfg: &Config, force: bool) -> Result<Vec<PathBuf>>`: writes `ops.yaml` (with a header comment block explaining each field), `.env.example` and `.mcp.json`. Returns the paths it wrote.
-  - `discover::env_names(cfg: &Config) -> Vec<String>` (sorted, deduped). Includes `EnvOr` env names (e.g. `EMBEDDINGS_MODEL`) as well as secrets.
+  - `discover::write_files(root: &Path, cfg: &Config, force: bool) -> Result<Vec<PathBuf>>`: writes `ops.yaml` (with a header comment block explaining each field, and saying credentials must be quoted strings; list entries such as `shared_libs`, `datastores` and `services` in block style, one field per line, as in the spec's example), `ops.example.yaml` (the same with every credential blank, for committing), `.env.example` and `.mcp.json`, and adds `ops.yaml` to `.gitignore` (creating it if needed). Returns the paths it wrote. It serializes the `Config` that `discover` built, never a loaded `Ctx.config` (that one has env overrides merged in).
+  - `discover::env_names(cfg: &Config) -> Vec<String>` (sorted, deduped): the `EnvOr` env names of settings (e.g. `EMBEDDINGS_MODEL`). Credentials have no env form.
   - `ops init` writes `semantic.embeddings.model: {env: EMBEDDINGS_MODEL, default: all-MiniLM-L6-v2}`, `incidents.dir: docs/incidents`, `correlation.clock_skew_ms: 500` with the three default `patterns` as a comment, and `changes.since: 7d` into the generated `ops.yaml`. It never git-ignores `ops-knowledge/`.
   - `discover::write_agent_instructions(root: &Path) -> Result<Vec<PathBuf>>`: for `ops init --agent-instructions` only (layer design §4.6). Appends a block between `<!-- ops-support -->` and `<!-- /ops-support -->` markers to each of `AGENTS.md` and `CLAUDE.md` that exists, or creates `AGENTS.md` when neither does. The block tells the agent to `recall` before changing or diagnosing a service, and to `remember` what it verified. A file that already has the marker is left as is.
 
@@ -259,13 +256,13 @@ The workspace setup below is already in the repo; only check it. The compose cha
   assert_eq!(c.services[1].docker.as_ref().unwrap().compose_service.as_deref(), Some("orders"));
   assert_eq!(c.datastores.iter().map(|d| (d.name.as_str(), d.kind)).collect::<Vec<_>>(), [("cache", DatastoreKind::Redis), ("db", DatastoreKind::Postgres)]);
   assert_eq!(c.services[1].datastores, ["cache", "db"]);
-  assert_eq!(c.workspace.kind, "monorepo");
+  assert_eq!(c.workspace.kind, WorkspaceKind::Monorepo);
   assert_eq!((c.contracts[0].kind, c.contracts[0].provider.as_deref()), (ContractKind::Openapi, Some("orders"))); }
 #[test] fn init_refuses_overwrite() { let d = tmp_fixture(); write_files(&d, &cfg, false).unwrap();
   std::fs::write(d.join("ops.yaml"), "edited").unwrap();
   assert!(write_files(&d, &cfg, false).is_err()); assert_eq!(std::fs::read_to_string(d.join("ops.yaml")).unwrap(), "edited");
   write_files(&d, &cfg, true).unwrap(); }
-#[test] fn written_config_round_trips() { /* Ctx::load(tmp) after write_files succeeds; env_names contains "MEMGRAPH_USER","MEMGRAPH_PASSWORD","DB_DATABASE_URL","CACHE_URL"; config.changes.since == "7d", config.correlation.clock_skew_ms == 500; ops.yaml text contains "traceparent" in a comment */ }
+#[test] fn written_config_round_trips() { /* Ctx::load(tmp) after write_files succeeds; env_names == ["EMBEDDINGS_MODEL"] (settings only; credentials have no env form); config.changes.since == "7d", config.correlation.clock_skew_ms == 500; ops.yaml text contains "traceparent" in a comment; .gitignore lists ops.yaml; ops.example.yaml exists with every credential "" */ }
 #[test] fn agent_instructions_opt_in() { /* write_files alone → AGENTS.md / CLAUDE.md untouched (absent stays absent); tmp CLAUDE.md "# mine" + write_agent_instructions twice → it starts with "# mine", contains "recall", and has the marker exactly once */ }
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine --test discover`. Expected: FAIL.
@@ -275,7 +272,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
   - **Python framework:** `fastapi` if the manifest mentions fastapi. Otherwise `worker` if any `.py` has `if __name__ == "__main__"` or the Dockerfile entrypoint starts with `python`. Otherwise it's a shared lib when its path contains `lib|libs|shared|common|packages`, else `none`.
   - **Compose link:** a compose service whose `build` equals the unit path. The unit name is the compose service name when linked, else the dir name.
   - **Datastores:** compose services whose image starts with `postgres` or `redis`.
-    - Name = compose name; `url = { env: "<NAME>_DATABASE_URL" }` for postgres, `{ env: "<NAME>_URL" }` for redis (NAME uppercased, `-` → `_`).
+    - Name = compose name; `url = ""` (the user fills it in; `validate` names every empty credential), with a comment giving the form, e.g. `postgres://USER:PASSWORD@localhost:<published port>/<db>`.
     - A service lists a datastore when `docker::connections` reaches it.
   - **Contracts:** each `openapi.{yaml,yml,json}` or `*.openapi.{yaml,yml,json}` (with a top-level `openapi:` key) becomes `kind: openapi`, with `provider` = the service whose path contains it, else unset. Library contracts are not written by init; Task 6 derives them.
   - **Workspace kind:** one unit → `single`; one `.git` at root or none → `monorepo`; several `.git` dirs → `multi-repo`.
@@ -469,7 +466,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
     5. When `enabled` is false: one piece, with the body cut to the budget.
     6. Stop at `max_chunks` and return `truncated = true`.
   - `graph::FileGraph { nodes: Vec<Node>, edges: Vec<Edge> }`. Edges are file-local only: `CONTAINS DEFINES HAS_METHOD LOGS READS_ENV HANDLED_BY`.
-  - `graph::file_graph(ctx: &Ctx, unit: &str /* service or lib name */, relpath: &str, src: &str, chunks: &ChunkParams) -> Result<FileGraph, SkipReason>`. `Err` when the file is skipped. Size and minified checks happen before parsing, using `indexing::limit_for`. It also emits `:Chunk` nodes (`chunk:{sym_id}:{ord}`, `layer: "structural"`, with `ord`, `start_line`, `end_line`, a redacted `text`, `text_hash`, `tokens_est`) and `CHUNK_OF` edges for every symbol with a card. A truncated symbol gets `chunks_truncated: true`.
+  - `graph::file_graph(ctx: &Ctx, unit: &str /* service or lib name */, relpath: &str, src: &str, chunks: &ChunkParams) -> Result<FileGraph, SkipReason>`. `Err` when the file is skipped. Size and minified checks happen before parsing, using `indexing::Limits` (build it once per run with `Limits::new(ctx)` and pass it in). It also emits `:Chunk` nodes (`chunk:{sym_id}:{ord}`, `layer: "structural"`, with `ord`, `start_line`, `end_line`, a redacted `text`, `text_hash`, `tokens_est`) and `CHUNK_OF` edges for every symbol with a card. A truncated symbol gets `chunks_truncated: true`.
   - `graph::workspace_graph(ctx: &Ctx) -> Result<Graph>`: Service/Datastore/EnvVar/Contract/Endpoint/Schema-from-OpenAPI nodes, plus docker edges (DEPENDS_ON CONNECTS_TO SHARES_VOLUME SETS_ENV USES_DATASTORE PROVIDES DECLARES DEFINES_SCHEMA). No per-file parsing.
   - `graph::LINK_RELS: &[&str] = &["CALLS","CALLS_API","USES_SCHEMA","IMPLEMENTED_BY","INJECTS","TEMPLATE_BINDS","USES_LIB","CONSUMES","SENDS_TO","RECEIVES_FROM","READS_TABLE","WRITES_TABLE","MAPS_TO","ON","BOUNDARY"]` and `graph::LINK_LABELS: &[&str] = &["Queue","Table"]``
   - `graph::LinkOutput { nodes: Vec<Node> /* Queue and Table */, edges: Vec<Edge>, unresolved_calls: usize, unresolved_queue_ops: usize }`
@@ -635,7 +632,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 ```
 - [ ] **Step 3: Run.** `cargo test -p engine store lock`. Expected: FAIL (compile).
 - [ ] **Step 4: Implement** `store`, `lock`.
-  - Credentials come from `memgraph.username`/`password` through `Secret::resolve`; when unset, connect without auth.
+  - Credentials come from `memgraph.username`/`password` (`expose_secret()` at connect time only); when unset, connect without auth.
   - Error format is exactly `memgraph <host>:<port>: <redacted cause>`, never the password. Part 2's smoke test matches on the `memgraph ` prefix.
   - Batches of 500 rows per `UNWIND`.
   - `// ponytail: relink recomputes all link edges each run; scope it to the affected units if relink time shows up in profiles.`
@@ -646,7 +643,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - Otherwise it runs `store::index` and prints the `IndexReport` as one line plus per-label counts.
   - `ops check [--root]`:
     1. `config::validate` problems.
-    2. Every secret or `EnvOr` that doesn't resolve, named by its env var.
+    2. Every `EnvOr` setting that doesn't resolve, named by its env var, and every empty credential, named by its field.
     3. `store::ping`.
     4. The last `IndexRun` time, the number of files changed since, and the number of files the last run skipped (layer design §3.1).
     5. `kubectl --context <ctx> version --client=false` when kubernetes is configured.
@@ -711,7 +708,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
     - **Re-embed only what changed:** `:Chunk` nodes with no `embedding`, or whose `text_hash` differs from their `embedded_hash`, plus every chunk when `reembed_all` is set. `SET c.embedding = $vec, c.embedded_hash = c.text_hash`. Re-embedding has exactly two triggers: a changed `embed_fingerprint`, or a changed chunk `text_hash`. A Full run never re-embeds by itself, which matters for paid remote models.
     - **`--full`** always sets `rebuild_index` (but not `reembed_all`), because deleted nodes don't free vector-index memory until the index is dropped.
     - **`TextOnly`:** skip embedding, and record the reason in `IndexReport.embedding: String`.
-  - `ops check` prints `embeddings: vector (local all-MiniLM-L6-v2, dim 384)`, or `remote openai, dim 1536`, or `text-only: <reason>`. It also warns when `SHOW VECTOR INDEX INFO` reports more than 2× as many vectors as live nodes.
+  - `ops check` is also the warmup: its `embeddings.model_info` call with the workspace config loads the configured model (downloading it the first time) and reports a bad model name or rejected key, redacted, before the first `ops index`. It prints `embeddings: vector (local all-MiniLM-L6-v2, dim 384)`, or `remote openai, dim 1536`, or `text-only: <reason>`. It also warns when `SHOW VECTOR INDEX INFO` reports more than 2× as many vectors as live nodes.
 
 - [ ] **Step 1: Failing tests**
 ```rust
@@ -728,7 +725,7 @@ The workspace setup below is already in the repo; only check it. The compose cha
 ```
 - [ ] **Step 2: Run.** `cargo test -p engine embed`. Expected: FAIL.
 - [ ] **Step 3: Implement.** Before coding, confirm the procedure signatures with `CALL mg.procedures() YIELD name, signature WHERE name STARTS WITH 'embeddings' OR name STARTS WITH 'vector_search' OR name STARTS WITH 'text_search' RETURN *`.
-- [ ] **Step 4: Run.** Unit tests PASS. With `docker compose --profile embeddings up -d`, the `--ignored` tests PASS.
+- [ ] **Step 4: Run.** Unit tests PASS. With `docker compose up -d`, the `--ignored` tests PASS.
 - [ ] **Step 5: Commit.** `git commit -am "feat: code-card embeddings and search indexes"`
 
 ---

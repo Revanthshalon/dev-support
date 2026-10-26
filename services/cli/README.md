@@ -47,7 +47,8 @@ Explore the result in Memgraph Lab at <http://localhost:3000>, or connect `ops-m
 
 `ops` reads `ops.yaml` from `--root`, or from the nearest ancestor directory that has one. The
 root [README](../../README.md#configuration--opsyaml) has the full reference. Credentials are
-literals or `{ env: NAME }`; env vars come from the process first, then from `.env`.
+quoted strings in `ops.yaml` (git-ignored; share `ops.example.yaml`). Non-secret settings can use
+`{ env: NAME }`, read from the process first, then from `.env`.
 
 Logs go to stderr and to `.ops/logs/ops.YYYY-MM-DD.jsonl` in the workspace (configured under
 `logging:`). The CLI writes no audit records; those are for MCP tool calls.

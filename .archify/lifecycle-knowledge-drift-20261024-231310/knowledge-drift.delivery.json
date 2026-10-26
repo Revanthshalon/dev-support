@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "7cb39441-82fb-44a4-a053-d164174269fc",
+  "status": "current",
+  "command": "deliver",
+  "type": "lifecycle",
+  "input": "/Users/revanth/Projects/ops-support/.archify/lifecycle-knowledge-drift-20261024-231310/candidate.json",
+  "output": "/Users/revanth/Projects/ops-support/.archify/lifecycle-knowledge-drift-20261024-231310/knowledge-drift.html",
+  "specification": {
+    "sha256": "e052486699d9fd24a4c00ba3e0b3ef44d50f0df95f45d58118bb88d306dd31d5",
+    "bytes": 3780
+  },
+  "artifact": {
+    "sha256": "093181601be118edd190c1b4aa9781ca4196ebe47ee421c374e34e88b75f4585",
+    "bytes": 816281
+  }
+}

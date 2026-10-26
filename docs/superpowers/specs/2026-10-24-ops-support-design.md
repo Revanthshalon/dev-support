@@ -20,8 +20,13 @@ the code flow, inspect configuration and datastores, determine the root cause an
   `serde_json`. Every finding can cite `file:line`.
 - **Configurable** via the file `ops init` generates: services, shared libraries, the APIs they
   expose/consume, framework, language, log sources, datastores.
-- **Credentials** come from the config file *or* the environment: every secret field is either a
-  literal string or `{ env: NAME }`. A `.env` at the workspace root is read; the process env wins.
+- **Credentials** live in `ops.yaml` as quoted strings, held in memory as `secrecy::SecretString`
+  (masked `Debug`, explicit `expose_secret()` to read, wiped on drop). There is no `{ env: NAME }`
+  form for credentials. Because `ops.yaml` holds secrets, `ops init` git-ignores it and writes a
+  shareable `ops.example.yaml` with the credentials blank. Non-secret settings (e.g.
+  `semantic.embeddings.model`) may still be a literal or `{ env: NAME, default }`; their env values
+  come from the process env, then `.env` at the workspace root. `OPS_*` env vars override any
+  scalar, credentials included (e.g. `OPS_MEMGRAPH__PASSWORD`).
 - **Log sources:** docker compose, Kubernetes (via `kubectl`, with a namespace allow-list in the
   config), file, custom command.
 - **Datastores v1:** PostgreSQL, Redis.
@@ -62,7 +67,7 @@ the code flow, inspect configuration and datastores, determine the root cause an
 ## Repository layout
 ```
 Cargo.toml                 workspace: services/{engine,cli,mcp}
-docker-compose.yml         memgraph (bind mount docker/memgraph/) + lab; `embeddings` profile for warmup
+docker-compose.yml         memgraph (bind mount docker/memgraph/) + lab
 docker-compose.gpu.yml     optional NVIDIA GPU override for local embedding models
 services/engine            library: config, discovery, parsing, graph, store, logs, datastores, lsp
 services/cli               binary `ops`: init | check | index [--full] | watch | knowledge export/import
@@ -77,8 +82,8 @@ workspace: { name: shop, kind: monorepo }          # single | monorepo | multi-r
 memgraph:
   host: localhost
   port: 7687
-  username: { env: MEMGRAPH_USER }
-  password: { env: MEMGRAPH_PASSWORD }
+  username: "ops"                                   # credentials: quoted strings; ops.yaml is git-ignored
+  password: "change-me"
 docker:
   compose_files: [docker-compose.yml]
 kubernetes:                                         # optional
@@ -87,7 +92,9 @@ kubernetes:                                         # optional
   namespaces: [shop]                                # allow-list; tools refuse others
 exclude: [node_modules, .venv, dist, .angular, __pycache__, .git]
 shared_libs:
-  - { name: common, path: libs/common, language: python }
+  - name: common
+    path: libs/common
+    language: python
 contracts:                                          # shared API schemas at service boundaries
   - name: orders-api
     kind: openapi                                   # openapi | library
@@ -107,8 +114,13 @@ services:
     datastores: [orders-db, cache]
     lsp: [pyright-langserver, --stdio]
 datastores:
-  - { name: orders-db, kind: postgres, url: { env: ORDERS_DB_URL } }
-  - { name: cache, kind: redis, url: "redis://localhost:6379/0", password: { env: REDIS_PASSWORD } }
+  - name: orders-db
+    kind: postgres
+    url: "postgres://app:secret@localhost:5432/orders"
+  - name: cache
+    kind: redis
+    url: "redis://localhost:6379/0"
+    password: "redis-secret"
 logging:                                            # optional; these are the defaults
   level: info                                       # trace | debug | info | warn | error
   format: text                                      # stderr format: text | json
@@ -118,7 +130,7 @@ logging:                                            # optional; these are the de
 semantic:                                           # optional; full option list in the layer design §4.5
   embeddings:
     enabled: true
-    model: { env: EMBEDDINGS_MODEL, default: all-MiniLM-L6-v2 }   # "provider/model" = remote via LiteLLM
+    model: { env: EMBEDDINGS_MODEL, default: all-MiniLM-L6-v2 }   # decides the model; env read from the workspace, not the container
     chunking: { enabled: true, max_tokens: auto, overlap_tokens: 32 }  # long symbols embedded in overlapping chunks
 incidents:
   dir: docs/incidents                               # where write_rca reports are saved
@@ -128,9 +140,13 @@ changes:
   since: 7d                                         # default look-back for recent_changes
 indexing:                                           # optional; layer design §3.1
   max_file_bytes: 1MiB                              # 0 = no limit; also --max-file-bytes / OPS_INDEXING__MAX_FILE_BYTES
-  overrides: [{ path: "services/legacy/**", max_file_bytes: 8MiB }]
+  overrides:
+    - path: "services/legacy/**"
+      max_file_bytes: 8MiB
 ```
-`ops init` also writes `.env.example` (every `env:` name referenced) and `.mcp.json`.
+`ops init` also writes `ops.example.yaml` (the same file with every credential blank, for sharing
+and committing), `.env.example` (every `env:` name a setting references) and `.mcp.json`, and adds
+`ops.yaml` to `.gitignore`.
 
 ## Graph model
 Every node carries `id` and `workspace`. Structural nodes (everything below) also carry
@@ -271,7 +287,11 @@ through `redact` before it reaches any sink.
 - Retention: on startup, rotated files older than `retention_days` are deleted.
 
 ## Safety rules
-- Secrets never appear in tool output or error text. All output goes through `redact`.
+- Secrets never appear in tool output or error text. All output goes through `redact`, and
+  credentials are `SecretString`s whose `Debug` is masked. A credential written as an unquoted
+  number is rejected at load (YAML would turn `0123` into 123), and an empty one is reported by
+  `validate` by field name, never by value.
+- `ops.yaml` holds credentials: `ops init` git-ignores it, and `read_file` / `lsp` always deny it.
 - `db_query` is read-only at the database: `BEGIN READ ONLY` + `statement_timeout`, user SQL
   wrapped as a subquery (one SELECT only), row cap, always `ROLLBACK`.
 - `redis_command` uses an allow-list of read commands.

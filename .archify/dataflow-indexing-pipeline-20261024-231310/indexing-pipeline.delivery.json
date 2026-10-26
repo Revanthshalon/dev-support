@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "69230d05-cfda-4ac2-a64b-ee438d6bfc12",
+  "status": "current",
+  "command": "deliver",
+  "type": "dataflow",
+  "input": "/Users/revanth/Projects/ops-support/.archify/dataflow-indexing-pipeline-20261024-231310/candidate.json",
+  "output": "/Users/revanth/Projects/ops-support/.archify/dataflow-indexing-pipeline-20261024-231310/indexing-pipeline.html",
+  "specification": {
+    "sha256": "06f6ff8afd8d1aba3b7946575f79702249cfba2d2b1dba0634d59e4288007792",
+    "bytes": 4682
+  },
+  "artifact": {
+    "sha256": "c2e0e3e8a8f3d6f26dd6ec50798912b6ed1c664930cff717a749d1041eab2682",
+    "bytes": 821820
+  }
+}

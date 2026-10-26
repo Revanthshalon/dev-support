@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "lifecycle",
+  "quality": "showcase",
+  "specification": {
+    "path": "/Users/revanth/Projects/ops-support/.archify/lifecycle-knowledge-drift-20261024-231310/candidate.json",
+    "sha256": "e052486699d9fd24a4c00ba3e0b3ef44d50f0df95f45d58118bb88d306dd31d5",
+    "bytes": 3780
+  },
+  "artifact": {
+    "path": "/Users/revanth/Projects/ops-support/.archify/lifecycle-knowledge-drift-20261024-231310/knowledge-drift.html",
+    "sha256": "093181601be118edd190c1b4aa9781ca4196ebe47ee421c374e34e88b75f4585",
+    "bytes": 816281
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/Users/revanth/Projects/ops-support/.archify/lifecycle-knowledge-drift-20261024-231310/review-2/knowledge-drift.finalize.json",
+    "summaryReceipt": "/Users/revanth/Projects/ops-support/.archify/lifecycle-knowledge-drift-20261024-231310/review-2/knowledge-drift.finalize-summary.json",
+    "browserCheckReceipt": "/Users/revanth/Projects/ops-support/.archify/lifecycle-knowledge-drift-20261024-231310/review-2/knowledge-drift.browser-check.json"
+  },
+  "update": {
+    "status": "update_available",
+    "installedVersion": "3.1.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": "https://github.com/tt-a1i/archify/releases/tag/v3.2.0",
+    "severity": "normal",
+    "checkedAt": "2026-10-24T17:44:00.388Z",
+    "source": "cache",
+    "noticeRequired": true,
+    "noticeText": "Archify update: 3.1.0 → 3.2.0. A previous check at 2026-10-24T17:44:00.388Z found a newer release. Release notes: https://github.com/tt-a1i/archify/releases/tag/v3.2.0. The installed Skill has not changed; ask to snooze or ignore this reminder.",
+    "eventKey": "archify@sha256:70e210265c59f24dcbdf2a502ff671104b5454e7ee7d3554aecd86bad32384f5"
+  },
+  "visualReview": "not-requested",
+  "durationMs": 1826
+}

@@ -27,6 +27,10 @@ config = { version = "0.15.27", features = ["yaml"] }
 regex = "1.13.1"
 shlex = "2.0.1"
 walkdir = "2.5.0"
+globset = "0.4.20"            # indexing.overrides path globs
+secrecy = { version = "0.10.3", features = ["serde"] }   # credentials: masked Debug, explicit expose, zeroized
+url = "2.5.8"                  # Datastore::connection_url (already in the tree via sqlx/redis)
+percent-encoding = "2.3.2"     # encoding credentials into URLs (already in the tree via url)
 
 # Parsing
 tree-sitter = "0.27.1"
